@@ -378,7 +378,7 @@ class MessageEditJournalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(app.save_message(self.example_message(801,"Шестая версия"),edited=True,
                                           update_id=9900014),edit_ids[-1])
         with app.db() as c:
-            self.assertEqual(c.execute("SELECT COUNT(*) AS n FROM message_edits WHERE chat_id=937110").fetchone()["n"],5)
+            self.assertEqual(c.execute("SELECT COUNT(*) AS n FROM message_edits WHERE chat_id=937110 AND message_id=801").fetchone()["n"],5)
 
     async def test_webhook_notifies_only_on_edit_and_escapes_html(self):
         app=app_module()
