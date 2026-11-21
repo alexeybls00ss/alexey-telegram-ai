@@ -1,8 +1,8 @@
 """Private owner-approved browser bridge to the Telegram Business archive.
 
 This is a *browser* interface, not an automatic ChatGPT memory connection.
-A Telegram owner command issues a one-use pairing code; the browser exchanges it
-for an HttpOnly, Secure, same-site-scoped session cookie. Nothing is public.
+The owner can issue a revocable read-only secret link for browsers that cannot
+persist cookies. The link grants access only to its holder; nothing is public.
 """
 import hashlib
 import hmac
@@ -10,7 +10,7 @@ import html
 import secrets
 import time
 from datetime import datetime
-from urllib.parse import parse_qs, quote
+from urllib.parse import parse_qs, quote, urlencode
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -18,6 +18,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 PAIRING_TTL_SECONDS=10*60
 SESSION_TTL_SECONDS=30*86400
 COOKIE_NAME="alexey_bridge_session"
+READ_LINK_QUERY="access"
 
 
 def _hash(value):
@@ -52,6 +53,27 @@ def redeem_login_code(db,code):
         c.execute("""INSERT INTO bridge_sessions(session_hash,csrf_token,created_at,expires_at)
             VALUES(?,?,?,?)""",(_hash(session),csrf,now,now+SESSION_TTL_SECONDS))
     return session
+
+
+def create_read_link(db,base_url):
+    """Generate a long-lived read-only bearer URL, replacing any earlier link.
+
+    The secret is returned only to the Telegram owner. Only its hash is stored.
+    """
+    token=secrets.token_urlsafe(48)
+    now=int(time.time())
+    with db() as c:
+        c.execute("""INSERT INTO bridge_read_keys(key_id,token_hash,created_at)
+            VALUES(1,?,?) ON CONFLICT(key_id) DO UPDATE SET
+            token_hash=excluded.token_hash, created_at=excluded.created_at""",
+            (_hash(token),now))
+    return base_url.rstrip("/")+"/bridge?"+urlencode({READ_LINK_QUERY:token})
+
+
+def revoke_read_link(db):
+    """Immediately disable any direct read link."""
+    with db() as c:
+        c.execute("DELETE FROM bridge_read_keys")
 
 
 def _escape(text):
@@ -108,11 +130,35 @@ def make_router(db,zone,add_note):
 
     def session_for(request):
         token=request.cookies.get(COOKIE_NAME)
-        if not token or len(token)>160:return None
+        if token and len(token)<=160:
+            with db() as c:
+                session=c.execute("""SELECT session_hash,csrf_token,expires_at
+                    FROM bridge_sessions WHERE session_hash=? AND expires_at>?""",
+                    (_hash(token),int(time.time()))).fetchone()
+            if session is not None:return session
+        # Direct links are limited to safe GET requests. Never grant POST/notes
+        # write access using a read-link secret, even with a forged CSRF token.
+        if request.method!="GET":return None
+        access=request.query_params.get(READ_LINK_QUERY,"")
+        if not 40<=len(access)<=120:return None
         with db() as c:
-            return c.execute("""SELECT session_hash,csrf_token,expires_at
-                FROM bridge_sessions WHERE session_hash=? AND expires_at>?""",
-                (_hash(token),int(time.time()))).fetchone()
+            entry=c.execute("SELECT token_hash FROM bridge_read_keys WHERE key_id=1").fetchone()
+        if entry and hmac.compare_digest(entry["token_hash"],_hash(access)):
+            return {"csrf_token":"","readonly":True}
+        return None
+
+    def url(request,path,**params):
+        """Preserve the read-link secret only inside this same-origin portal."""
+        access=request.query_params.get(READ_LINK_QUERY)
+        if access and session_for(request) is not None:
+            params[READ_LINK_QUERY]=access
+        return path+("?"+urlencode(params) if params else "")
+
+    def read_hidden(request):
+        access=request.query_params.get(READ_LINK_QUERY)
+        if access and session_for(request) is not None:
+            return f'<input type="hidden" name="{READ_LINK_QUERY}" value="{_escape(access)}">'
+        return ""
 
     def require(request):
         session=session_for(request)
@@ -120,15 +166,20 @@ def make_router(db,zone,add_note):
             raise HTTPException(status_code=401,detail="Sign in using Telegram /sync_link")
         return session
 
-    def nav():
-        return ('<nav><strong>🐗 Alexey AI</strong><a href="/bridge">Главная</a>'
-                '<a href="/bridge/chats">Чаты</a><a href="/bridge/search">Поиск</a>'
-                '<a href="/bridge/notes">Заметки</a><a href="/bridge/status">Состояние</a>'
-                '<form action="/bridge/logout" method="post" style="margin:0">'
-                '<button type="submit" class="btnlink">Выйти</button></form></nav>')
+    def nav(request):
+        links=[("Главная","/bridge"),("Чаты","/bridge/chats"),
+               ("Поиск","/bridge/search"),("Заметки","/bridge/notes"),
+               ("Состояние","/bridge/status")]
+        content='<nav><strong>🐗 Alexey AI</strong>'
+        for label,path in links:
+            content+=f'<a href="{_escape(url(request,path))}">{label}</a>'
+        if not (session_for(request) or {}).get("readonly",False):
+            content+=('<form action="/bridge/logout" method="post" style="margin:0">'
+                      '<button type="submit" class="btnlink">Выйти</button></form>')
+        return content+"</nav>"
 
-    def page(title,body):
-        return _html(title,nav()+body)
+    def page(request,title,body):
+        return _html(title,nav(request)+body)
 
     def login_page(error=""):
         msg=f'<p class="warn">{_escape(error)}</p>' if error else ""
@@ -156,10 +207,10 @@ def make_router(db,zone,add_note):
               "<p>Подключён защищённый браузерный доступ. Здесь нет автоматической загрузки в память ChatGPT.</p>"
               f"<div class=card>Сообщений: <b>{messages}</b><br>Чатов: <b>{chats}</b><br>"
               f"Заметок: <b>{notes}</b><br>Дата последнего сообщения: <b>{_stamp(last,zone)}</b></div>"
-              '<p><a href="/bridge/chats">Открыть чаты</a> · '
-              '<a href="/bridge/search">Найти сообщение</a> · '
-              '<a href="/bridge/notes">Общие заметки</a></p>')
-        return page("Главная",body)
+              f'<p><a href="{_escape(url(request,"/bridge/chats"))}">Открыть чаты</a> · '
+              f'<a href="{_escape(url(request,"/bridge/search"))}">Найти сообщение</a> · '
+              f'<a href="{_escape(url(request,"/bridge/notes"))}">Общие заметки</a></p>')
+        return page(request,"Главная",body)
 
     @router.post("/bridge/login")
     async def portal_login(request:Request):
@@ -193,7 +244,7 @@ def make_router(db,zone,add_note):
             photos=c.execute("SELECT COUNT(*) FROM archived_photos").fetchone()[0]
             edits=c.execute("SELECT COUNT(*) FROM message_edits").fetchone()[0]
             mt=c.execute("SELECT COUNT(*) FROM mtproto_photos").fetchone()[0]
-        return page("Статус",f'<h1>Состояние архива</h1><div class="card">'
+        return page(request,"Статус",f'<h1>Состояние архива</h1><div class="card">'
                     f"Business подключений: {_escape(conn['active'])}/{_escape(conn['n'])}<br>"
                     f"Последнее событие получено: {_stamp(latest,zone)}<br>"
                     f"Сохранено фотографий: {photos}<br>Редактирований: {edits}<br>"
@@ -218,16 +269,17 @@ def make_router(db,zone,add_note):
                 (*args,(page_no-1)*50)).fetchall()
         parts=['<h1>Чаты в архиве</h1>',
                '<form method="get" action="/bridge/chats"><label>Найти по имени чата</label>',
+               read_hidden(request),
                f'<input name="q" value="{_escape(search)}"><p><button>Найти</button></p></form>']
         for row in rows:
-            parts.append(f'<div class="card"><a href="/bridge/chat/{row["chat_id"]}">'
+            parts.append(f'<div class="card"><a href="{_escape(url(request,"/bridge/chat/"+str(row["chat_id"])))}">'
                          f'{_escape(row["title"] or row["chat_id"])}</a> '
                          f'<small>ID {row["chat_id"]} · {row["n"]} сообщений · '
                          f'{_stamp(row["last_at"],zone)}</small></div>')
         if not rows:parts.append("<p>Подходящих чатов нет.</p>")
         if len(rows)>=50:
-            parts.append(f'<a href="/bridge/chats?q={quote(search)}&page_no={page_no+1}">Следующая страница</a>')
-        return page("Чаты","".join(parts))
+            parts.append(f'<a href="{_escape(url(request,"/bridge/chats",q=search,page_no=page_no+1))}">Следующая страница</a>')
+        return page(request,"Чаты","".join(parts))
 
     @router.get("/bridge/chat/{chat_id}")
     async def portal_chat(request:Request,chat_id:int,page_no:int=1):
@@ -249,14 +301,15 @@ def make_router(db,zone,add_note):
                          f'<pre>{_escape(row["text"])}</pre></div>')
         if not rows:parts.append("<p>Нет сообщений на этой странице.</p>")
         if len(rows)==60:
-            parts.append(f'<a href="/bridge/chat/{chat_id}?page_no={page_no+1}">Сообщения раньше</a>')
-        return page("Переписка","".join(parts))
+            parts.append(f'<a href="{_escape(url(request,"/bridge/chat/"+str(chat_id),page_no=page_no+1))}">Сообщения раньше</a>')
+        return page(request,"Переписка","".join(parts))
 
     @router.get("/bridge/search")
     async def portal_search(request:Request,q:str=""):
         require(request)
         term=q.strip()[:120]
         parts=['<h1>Поиск по архиву</h1><form action="/bridge/search" method="get">'
+               read_hidden(request),
                '<label>Слово или фраза</label>'
                f'<input name="q" value="{_escape(term)}"><p><button>Найти</button></p></form>']
         if term:
@@ -270,12 +323,12 @@ def make_router(db,zone,add_note):
             for row in rows:
                 preview=(row["text"] or "")[:1300]
                 parts.append('<div class="card">'
-                             f'<a href="/bridge/chat/{row["chat_id"]}">{_escape(row["chat_title"])}</a> '
+                             f'<a href="{_escape(url(request,"/bridge/chat/"+str(row["chat_id"])))}">{_escape(row["chat_title"])}</a> '
                              f'<small>#{row["message_id"]} · '
                              f'{_stamp(row["message_date"],zone)} · '
                              f'{_escape(row["sender_name"])}</small>'
                              f'<pre>{_escape(preview)}</pre></div>')
-        return page("Поиск","".join(parts))
+        return page(request,"Поиск","".join(parts))
 
     @router.get("/bridge/notes")
     async def portal_notes(request:Request):
@@ -286,16 +339,19 @@ def make_router(db,zone,add_note):
         parts=['<h1>Общие заметки</h1>',
                '<p class="muted">Записанные здесь факты можно читать из Telegram через /sync_notes. '
                'Никакой записи во внутреннюю память ChatGPT не происходит.</p>',
-               '<form action="/bridge/notes" method="post" class="card">'
-               f'<input name="csrf" type="hidden" value="{_escape(session["csrf_token"])}">'
-               '<label>Название</label><input name="subject" maxlength="150" required>'
-               '<label>Текст заметки</label><textarea name="content" maxlength="8000" required></textarea>'
-               '<p><button>Сохранить общую заметку</button></p></form>']
+               ]
+        if not (session or {}).get("readonly",False):
+            parts.extend([
+               '<form action="/bridge/notes" method="post" class="card">',
+               f'<input name="csrf" type="hidden" value="{_escape(session["csrf_token"])}">',
+               '<label>Название</label><input name="subject" maxlength="150" required>',
+               '<label>Текст заметки</label><textarea name="content" maxlength="8000" required></textarea>',
+               '<p><button>Сохранить общую заметку</button></p></form>'])
         for r in notes:
             parts.append(f'<div class="card"><small>#{r["id"]} · '
                          f'{_stamp(r["created_at"],zone)} · {_escape(r["source"])}</small>'
                          f'<h2>{_escape(r["subject"])}</h2><pre>{_escape(r["content"])}</pre></div>')
-        return page("Заметки","".join(parts))
+        return page(request,"Заметки","".join(parts))
 
     @router.post("/bridge/notes")
     async def portal_add_note(request:Request):
@@ -308,7 +364,7 @@ def make_router(db,zone,add_note):
         try:
             add_note(form.get("subject",""),form.get("content",""),source="chatgpt")
         except ValueError as exc:
-            return page("Ошибка",f'<p>{_escape(exc)}</p><p><a href="/bridge/notes">Назад</a></p>')
+            return page(request,"Ошибка",f'<p>{_escape(exc)}</p><p><a href="/bridge/notes">Назад</a></p>')
         return RedirectResponse("/bridge/notes",status_code=303)
 
     return router
