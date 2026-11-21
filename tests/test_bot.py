@@ -33,59 +33,84 @@ class ReportFormattingTests(unittest.TestCase):
 
 
 
-class ExpiringMediaTests(unittest.TestCase):
-    def test_view_once_flag_detection(self):
+class DeletedMessagesTests(unittest.IsolatedAsyncioTestCase):
+    async def test_alert_only_on_deletion(self):
         app=app_module()
-        photo=[{"file_id":"photo-id"}]
-        self.assertTrue(app.is_expiring_photo({"photo":photo,"ttl_seconds":2147483647}))
-        self.assertTrue(app.is_expiring_photo({"photo":photo,"view_once":True}))
-        self.assertFalse(app.is_expiring_photo({"photo":photo}))
-        self.assertFalse(app.is_expiring_photo({"ttl_seconds":10}))
-
-    def test_owner_can_save_photo_from_reply(self):
-        app=app_module()
+        app.init_db()
+        app.set_deleted_alerts_enabled(True)
+        app.save_connection({"id":"deletion-test-connection","user":{"id":100},
+                             "is_enabled":True,"rights":{}})
         message={
-            "chat":{"id":222,"first_name":"Собеседник"},
-            "from":{"id":100},
-            "text":"/save_once",
-            "reply_to_message":{
-                "message_id":9,
-                "from":{"id":222,"first_name":"Собеседник"},
-                "photo":[{"file_id":"file-test","file_size":123}]
-            }
+            "business_connection_id":"deletion-test-connection",
+            "chat":{"id":929292,"first_name":"Тестовый собеседник"},
+            "message_id":4141,"date":1790000000,
+            "from":{"id":929292,"first_name":"Собеседник"},
+            "text":"Сообщение, которое потом удалят"
         }
+        event={
+            "business_connection_id":"deletion-test-connection",
+            "chat":{"id":929292,"first_name":"Тестовый собеседник"},
+            "message_ids":[4141]
+        }
+        class UpdateRequest:
+            def __init__(self,data):self.data=data
+            async def json(self):return self.data
         with patch.object(app,"BOT_OWNER_ID","100"), \
-             patch.object(app,"mirror_enabled",return_value=True), \
-             patch.object(app,"copy_photo_to_owner",new_callable=AsyncMock,return_value=True) as copy:
-            asyncio.run(app.maybe_copy_replied_photo(message))
-        copy.assert_awaited_once()
-        self.assertEqual(copy.await_args.args[0],"file-test")
-        self.assertEqual(copy.await_args.args[2],100)
+             patch.object(app,"WEBHOOK_SECRET","test-key"), \
+             patch.object(app,"send_long_text",new_callable=AsyncMock) as alert:
+            await app.webhook(UpdateRequest({"update_id":88001001,"business_message":message}),
+                              x_telegram_bot_api_secret_token="test-key")
+            alert.assert_not_awaited()
+            await app.webhook(UpdateRequest({"update_id":88001002,"deleted_business_messages":event}),
+                              x_telegram_bot_api_secret_token="test-key")
+            alert.assert_awaited_once()
+            text=alert.await_args.args[1]
+            self.assertIn("УДАЛЕНО",text)
+            self.assertIn("Сообщение, которое потом удалят",text)
+            self.assertIn("Собеседник",text)
+            self.assertIn("4141",text)
+            with app.db() as conn:
+                row=conn.execute("SELECT deleted FROM messages WHERE chat_id=? AND message_id=?",
+                                 (929292,4141)).fetchone()
+            self.assertEqual(row["deleted"],1)
+            alert.reset_mock()
+            await app.webhook(UpdateRequest({"update_id":88001003,"deleted_business_messages":event}),
+                              x_telegram_bot_api_secret_token="test-key")
+            alert.assert_not_awaited()
 
-    def test_unrequested_plain_reply_does_not_capture(self):
+    async def test_unknown_original_explains_limit(self):
         app=app_module()
-        message={
-            "chat":{"id":222},"from":{"id":100},"text":"Окей",
-            "reply_to_message":{"photo":[{"file_id":"file-test"}],"from":{"id":222}}
-        }
+        app.init_db()
+        app.set_deleted_alerts_enabled(True)
+        event={"business_connection_id":"deletion-test-connection",
+               "chat":{"id":929293,"first_name":"Другой чат"},
+               "message_ids":[4888]}
         with patch.object(app,"BOT_OWNER_ID","100"), \
-             patch.object(app,"mirror_enabled",return_value=True), \
-             patch.object(app,"copy_photo_to_owner",new_callable=AsyncMock) as copy:
-            asyncio.run(app.maybe_copy_replied_photo(message))
-        copy.assert_not_awaited()
+             patch.object(app,"send_long_text",new_callable=AsyncMock) as alert:
+            await app.handle_deleted_business_messages(event)
+            alert.assert_awaited_once()
+            self.assertIn("не получил исходное сообщение",alert.await_args.args[1])
 
-    def test_protected_reply_not_copied(self):
+    async def test_disabled_suppresses_notification_but_marks_deleted(self):
         app=app_module()
-        message={
-            "from":{"id":100},"text":"/save_once",
-            "reply_to_message":{"photo":[{"file_id":"secret"}],"has_protected_content":True}
-        }
+        app.init_db()
+        app.save_connection({"id":"deletion-off-connection","user":{"id":100},
+                             "is_enabled":True,"rights":{}})
+        app.save_message({
+            "business_connection_id":"deletion-off-connection",
+            "chat":{"id":929294,"first_name":"Тест"},
+            "message_id":4142,"date":1790000000,
+            "from":{"id":929294,"first_name":"Собеседник"},"text":"Текст"})
+        event={"business_connection_id":"deletion-off-connection",
+               "chat":{"id":929294},"message_ids":[4142]}
         with patch.object(app,"BOT_OWNER_ID","100"), \
-             patch.object(app,"mirror_enabled",return_value=True), \
-             patch.object(app,"copy_photo_to_owner",new_callable=AsyncMock) as copy, \
-             patch.object(app,"send_text",new_callable=AsyncMock):
-            asyncio.run(app.maybe_copy_replied_photo(message))
-        copy.assert_not_awaited()
+             patch.object(app,"deleted_alerts_enabled",return_value=False), \
+             patch.object(app,"send_long_text",new_callable=AsyncMock) as alert:
+            await app.handle_deleted_business_messages(event)
+            alert.assert_not_awaited()
+        with app.db() as conn:
+            row=conn.execute("SELECT deleted FROM messages WHERE chat_id=929294 AND message_id=4142").fetchone()
+        self.assertEqual(row["deleted"],1)
 
 if __name__=="__main__":
     unittest.main()
