@@ -1,5 +1,7 @@
 import asyncio
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 def app_module():
@@ -111,6 +113,92 @@ class DeletedMessagesTests(unittest.IsolatedAsyncioTestCase):
         with app.db() as conn:
             row=conn.execute("SELECT deleted FROM messages WHERE chat_id=929294 AND message_id=4142").fetchone()
         self.assertEqual(row["deleted"],1)
+
+class PhotoArchiveTests(unittest.IsolatedAsyncioTestCase):
+    async def test_photo_is_saved_and_sent_only_when_message_is_deleted(self):
+        app=app_module()
+        app.init_db()
+        app.set_deleted_alerts_enabled(True)
+        event_message={
+            "business_connection_id":"photo-test-connection",
+            "chat":{"id":935010,"first_name":"Фотосообщения"},
+            "message_id":5021,"date":1790000000,
+            "from":{"id":935010,"first_name":"Собеседник"},
+            "photo":[{"file_id":"telegram-photo-id","file_unique_id":"unique-photo","file_size":5}],
+            "caption":"Вот изображение"
+        }
+        deleted={"business_connection_id":"photo-test-connection",
+                 "chat":{"id":935010},"message_ids":[5021]}
+        async def fake_download(remote_path,destination):
+            destination.parent.mkdir(parents=True,exist_ok=True)
+            destination.write_bytes(b"\xff\xd8test\xff\xd9")
+            return destination.stat().st_size
+
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(app,"PHOTO_ARCHIVE_DIR",Path(directory)), \
+             patch.object(app,"BOT_OWNER_ID","100"), \
+             patch.object(app,"telegram_api",new_callable=AsyncMock) as api, \
+             patch.object(app,"download_telegram_photo",new_callable=AsyncMock,side_effect=fake_download) as download, \
+             patch.object(app,"send_long_text",new_callable=AsyncMock) as send_text, \
+             patch.object(app,"send_archived_photo",new_callable=AsyncMock) as send_photo:
+            api.return_value={"file_path":"photos/file_1.jpg","file_size":6}
+            app.save_message(event_message)
+            self.assertTrue(await app.archive_business_photo(event_message))
+            send_text.assert_not_awaited()
+            send_photo.assert_not_awaited()
+            download.assert_awaited_once()
+            with app.db() as con:
+                stored=con.execute("""SELECT * FROM archived_photos
+                    WHERE connection_id=? AND chat_id=? AND message_id=?""",
+                    ("photo-test-connection",935010,5021)).fetchone()
+            self.assertIsNotNone(stored)
+            self.assertTrue(Path(stored["file_path"]).is_file())
+            self.assertEqual(stored["file_size"],6)
+            self.assertTrue(await app.archive_business_photo(event_message))
+            download.assert_awaited_once()
+            await app.handle_deleted_business_messages(deleted)
+            send_text.assert_awaited_once()
+            self.assertIn("Вот изображение",send_text.await_args.args[1])
+            send_photo.assert_awaited_once()
+            self.assertEqual(send_photo.await_args.args[1]["message_id"],5021)
+            self.assertTrue(send_photo.await_args.args[2].is_file())
+            await app.handle_deleted_business_messages(deleted)
+            send_photo.assert_awaited_once()
+
+    async def test_no_photo_archive_if_protected(self):
+        app=app_module()
+        app.init_db()
+        protected={"business_connection_id":"photo-test-connection",
+                   "chat":{"id":935010},"message_id":5022,
+                   "has_protected_content":True,
+                   "photo":[{"file_id":"protected-file-id"}]}
+        with patch.object(app,"telegram_api",new_callable=AsyncMock) as api:
+            self.assertFalse(await app.archive_business_photo(protected))
+            api.assert_not_awaited()
+
+    async def test_missing_photo_retains_text_notification(self):
+        app=app_module()
+        app.init_db()
+        app.set_deleted_alerts_enabled(True)
+        event_message={
+            "business_connection_id":"photo-missing-connection",
+            "chat":{"id":935011,"first_name":"Тест"},
+            "message_id":5023,"date":1790000000,
+            "from":{"id":935011,"first_name":"Собеседник"},
+            "photo":[{"file_id":"unavailable"}]
+        }
+        app.save_message(event_message)
+        event={"business_connection_id":"photo-missing-connection",
+               "chat":{"id":935011},"message_ids":[5023]}
+        with patch.object(app,"BOT_OWNER_ID","100"), \
+             patch.object(app,"send_long_text",new_callable=AsyncMock) as text_alert, \
+             patch.object(app,"send_text",new_callable=AsyncMock) as missing_alert:
+            await app.handle_deleted_business_messages(event)
+            text_alert.assert_awaited_once()
+            self.assertIn("[вложение: photo]",text_alert.await_args.args[1])
+            missing_alert.assert_awaited_once()
+            self.assertIn("не было сохранено",missing_alert.await_args.args[1])
+
 
 if __name__=="__main__":
     unittest.main()
