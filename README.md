@@ -86,3 +86,19 @@ Price table (USD per 1M standard text tokens, checked 2026-11-21; input / cached
 The existing api_usage SQLite table is migrated without deleting legacy rows. New columns: tier, cached_input_tokens, estimated_cost_usd. Older rows have NULL cost and are excluded from USD totals; /usage labels the number of such rows. Costs are estimated from the Responses API usage for successful responses (including cached input) using the published token prices. It is not the authoritative OpenAI invoice: failed calls, tax, other API features or future pricing changes may differ.
 
 Existing ANALYSIS_BUDGET_USD (default 0.10) applies to multi-call analysis jobs. PREMIUM_BUDGET_USD (default 0.30) controls the estimated pre-call guard for a premium one-off request. These are best-effort estimates, not guaranteed payment ceilings. Configure billing/spend limits at OpenAI Platform. The legacy Railway variable OPENAI_MODEL is deliberately ignored after this change to prevent accidental global premium selection.
+
+
+## Direct read-only Telegram archive link (2026-11-21)
+
+The owner can now issue an unguessable read-only URL with /sync_link in their private Telegram conversation with the bot. The link opens the /bridge portal, chat list, individual chat messages, search, status, and notes without a repeated one-time-code login or TinyFish cookie persistence. Access is **not public**: anyone with the secret link can view the archive, so keep it private and never paste it in public channels, tickets, code, or screenshots.
+
+- Sending /sync_link again immediately rotates the secret, invalidating the previous URL.
+- /sync_revoke immediately disables all direct read-link access.
+- Only the Telegram owner (BOT_OWNER_ID) can request or revoke the link.
+- The randomly generated token is stored in SQLite only as a SHA-256 hash.
+- Direct links grant GET-only *read* access, not POST or modification of shared notes or archive data.
+- Original browser cookie login remains supported for legacy sessions; anonymous /bridge/chats stays blocked.
+- Site responses use no-store and no-referrer headers to reduce token/data leakage.
+- Uvicorn access logging is disabled: its default URL logs would otherwise disclose the bearer query token. Railway and other proxy/network systems may still see request URLs.
+
+**Security:** The URL is effectively a password to all currently accessible chat data. It has no automatic expiry until rotated or revoked. Do not expose it publicly or grant it to untrusted websites/apps. For extra assurance, run /sync_revoke to disable it.
