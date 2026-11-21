@@ -9,7 +9,7 @@ import hmac
 import html
 import secrets
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import parse_qs, quote, urlencode
 
 from fastapi import APIRouter, HTTPException, Request
@@ -168,7 +168,7 @@ def make_router(db,zone,add_note):
 
     def nav(request):
         links=[("Главная","/bridge"),("Чаты","/bridge/chats"),
-               ("Поиск","/bridge/search"),("Заметки","/bridge/notes"),
+               ("За сутки","/bridge/period"),("Поиск","/bridge/search"),("Заметки","/bridge/notes"),
                ("Состояние","/bridge/status")]
         content='<nav><strong>🐗 Alexey AI</strong>'
         for label,path in links:
@@ -252,6 +252,98 @@ def make_router(db,zone,add_note):
                     f"Сохранено фотографий: {photos}<br>Редактирований: {edits}<br>"
                     f"Исчезающих фото MTProto: {mt}</div>"
                     '<p class="muted">Статистика доступных данных, а не гарантия полного охвата Telegram.</p>')
+
+    @router.get("/bridge/period")
+    async def portal_period(request:Request,from_local:str="",to_local:str="",page_no:int=1):
+        """Fast, owner-authorized cross-chat timeline in a single indexed DB query.
+
+        The secret read-link works exactly like other GET pages and cannot write
+        to the archive. Period bounds are expressed in the archive's timezone.
+        """
+        require(request)
+        if bool(from_local)!=bool(to_local):
+            raise HTTPException(400,"Specify both from_local and to_local")
+        if from_local:
+            if len(from_local)>25 or len(to_local)>25:
+                raise HTTPException(400,"Invalid date/time")
+            try:
+                start_dt=datetime.fromisoformat(from_local)
+                end_dt=datetime.fromisoformat(to_local)
+                if start_dt.tzinfo is not None or end_dt.tzinfo is not None:
+                    raise ValueError("Timezone offset is not expected")
+                start_dt=start_dt.replace(tzinfo=zone)
+                end_dt=end_dt.replace(tzinfo=zone)
+            except ValueError:
+                raise HTTPException(400,"Use YYYY-MM-DDTHH:MM in archive local time")
+            start_ts=int(start_dt.timestamp())
+            end_ts=int(end_dt.timestamp())
+        else:
+            end_ts=int(time.time())
+            start_ts=end_ts-86400
+            start_dt=datetime.fromtimestamp(start_ts,zone)
+            end_dt=datetime.fromtimestamp(end_ts,zone)
+        if end_ts<=start_ts or end_ts-start_ts>86400:
+            raise HTTPException(400,"Period must be positive and no more than 24 hours")
+        if page_no<1 or page_no>10000:
+            raise HTTPException(400,"Invalid page number")
+        page_size=200
+        with db() as c:
+            count=c.execute("""SELECT COUNT(*) AS n, COUNT(DISTINCT chat_id) AS chats
+                FROM messages WHERE message_date>=? AND message_date<?""",
+                (start_ts,end_ts)).fetchone()
+            rows=c.execute("""SELECT m.chat_id,m.chat_title,m.message_id,m.message_date,
+                m.sender_id,m.sender_name,m.sender_is_business_bot,m.text,m.deleted,m.edited,
+                b.user_id AS owner_user_id
+                FROM messages AS m LEFT JOIN business_connections AS b
+                    ON b.connection_id=m.connection_id
+                WHERE m.message_date>=? AND m.message_date<?
+                ORDER BY m.message_date ASC,m.id ASC
+                LIMIT ? OFFSET ?""",
+                (start_ts,end_ts,page_size,(page_no-1)*page_size)).fetchall()
+        parts=['<h1>Все сообщения за период</h1>',
+               f'<p class="muted">Часовой пояс: {_escape(zone.key)}. '
+               f'С {_escape(_stamp(start_ts,zone))} до {_escape(_stamp(end_ts,zone))} '
+               '(конец не включён). Чатов с сообщениями: '
+               f'{count["chats"]}; сообщений: {count["n"]}. Страница {page_no}. '
+               'Содержимое только из подключённого архива, не из всего Telegram.</p>',
+               '<p class="muted">Владелец/собеседник отмечены только при наличии '
+               'проверяемого sender_id и owner_user_id. «Не определено» '
+               'не означает входящее сообщение.</p>',
+               '<form action="/bridge/period" method="get">',
+               read_hidden(request),
+               '<label>С (YYYY-MM-DDTHH:MM)</label>',
+               f'<input name="from_local" value="{_escape(start_dt.strftime("%Y-%m-%dT%H:%M"))}">',
+               '<label>По (YYYY-MM-DDTHH:MM)</label>',
+               f'<input name="to_local" value="{_escape(end_dt.strftime("%Y-%m-%dT%H:%M"))}">',
+               '<p><button>Показать</button></p></form>']
+        for r in rows:
+            if r["sender_is_business_bot"]:
+                role="Бизнес-бот"
+            elif r["sender_id"] is None or r["owner_user_id"] is None:
+                role="Не определено"
+            elif r["sender_id"]==r["owner_user_id"]:
+                role="Владелец"
+            else:
+                role="Собеседник"
+            flags=(" · удалено" if r["deleted"] else "")+(" · редактировано" if r["edited"] else "")
+            body=r["text"] or ""
+            truncated=body[:4000]
+            if len(body)>4000:truncated+="\n[Текст сокращён до 4000 символов]"
+            parts.append('<div class="card">'
+                         f'<small>{_escape(_stamp(r["message_date"],zone))} · '
+                         f'{_escape(r["chat_title"] or r["chat_id"])} '
+                         f'(чат {r["chat_id"]}) · '
+                         f'{_escape(role)} · '
+                         f'{_escape(r["sender_name"] or "Имя не определено")} '
+                         f'· #{r["message_id"]}{flags}</small>'
+                         f'<pre>{_escape(truncated)}</pre></div>')
+        if not rows:parts.append('<p>В архиве нет сообщений за этот период на этой странице.</p>')
+        if page_no*page_size<count["n"]:
+            parts.append('<p><a href="'+_escape(url(
+                request,"/bridge/period",from_local=start_dt.strftime("%Y-%m-%dT%H:%M"),
+                to_local=end_dt.strftime("%Y-%m-%dT%H:%M"),page_no=page_no+1
+            ))+'">Следующая страница (200 сообщений)</a></p>')
+        return page(request,"Все сообщения за период","".join(parts))
 
     @router.get("/bridge/chats")
     async def portal_chats(request:Request,q:str="",page_no:int=1):
