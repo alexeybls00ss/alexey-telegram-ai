@@ -23,6 +23,10 @@ INTEGRATION_TOKEN=os.getenv("INTEGRATION_TOKEN","").strip()
 DATABASE_PATH=Path(os.getenv("DATABASE_PATH","./data/archive.sqlite3"))
 PHOTO_ARCHIVE_DIR=Path(os.getenv("PHOTO_ARCHIVE_DIR",str(DATABASE_PATH.parent/"photos")))
 PHOTO_LIMIT_BYTES=10*1024*1024
+MT_PROTO_ENABLED=os.getenv("MT_PROTO_ENABLED","false").lower() in ("true","1","yes")
+TELEGRAM_API_ID=os.getenv("TELEGRAM_API_ID","").strip()
+TELEGRAM_API_HASH=os.getenv("TELEGRAM_API_HASH","").strip()
+TELEGRAM_SESSION=os.getenv("TELEGRAM_SESSION","").strip()
 LOCAL_TZ=ZoneInfo(os.getenv("APP_TIMEZONE","Europe/Moscow"))
 REPORT_LOCK=asyncio.Lock()
 ANALYSIS_BUDGET_USD=float(os.getenv("ANALYSIS_BUDGET_USD","0.10"))
@@ -36,6 +40,7 @@ PENDING_ANALYSES={}
 AUTO_DAILY_ANALYSIS=os.getenv("AUTO_DAILY_ANALYSIS","true").lower() in ("true","1","yes")
 class AnalysisBudgetExceeded(RuntimeError): pass
 DAILY_TASK=None
+MT_PROTO_TASK=None
 app=FastAPI(title="Alexey Telegram AI",version="0.3.0")
 
 def db_connect():
@@ -83,6 +88,12 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_daily_chat_summaries_date ON daily_chat_summaries(report_date DESC)")
         c.execute("CREATE TABLE IF NOT EXISTS analysis_chunk_cache(chat_id INTEGER,chunk_hash TEXT,summary TEXT,created_at INTEGER,PRIMARY KEY(chat_id,chunk_hash))")
         c.execute("CREATE TABLE IF NOT EXISTS bot_settings(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
+        c.execute("""CREATE TABLE IF NOT EXISTS mtproto_photos(
+            chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
+            file_path TEXT NOT NULL, ttl_seconds INTEGER NOT NULL,
+            source TEXT NOT NULL, saved_at INTEGER NOT NULL,
+            delivered_at INTEGER,
+            PRIMARY KEY(chat_id,message_id))""")
         c.execute("""CREATE TABLE IF NOT EXISTS archived_photos(
             connection_id TEXT NOT NULL,chat_id INTEGER NOT NULL,message_id INTEGER NOT NULL,
             photo_unique_id TEXT NOT NULL,file_path TEXT NOT NULL,file_size INTEGER NOT NULL,
@@ -354,6 +365,68 @@ async def send_archived_photo(owner_id,row,photo_path):
     if not response.json().get("ok"):
         raise RuntimeError("Telegram rejected archived photo")
 
+async def run_mtproto_archive():
+    """Only starts after the owner supplies an authorized Telegram session."""
+    from mtproto_capture import watch_expiring_photos
+
+    async def on_saved(chat_id,message_id,file_path,ttl,source):
+        local=Path(file_path).resolve()
+        if not local.is_relative_to(PHOTO_ARCHIVE_DIR.resolve()):
+            raise ValueError("MTProto photo is outside the configured media directory")
+        with db() as c:
+            c.execute("""INSERT INTO mtproto_photos(
+                chat_id,message_id,file_path,ttl_seconds,source,saved_at)
+                VALUES(?,?,?,?,?,?)
+                ON CONFLICT(chat_id,message_id) DO UPDATE SET
+                file_path=excluded.file_path,
+                ttl_seconds=excluded.ttl_seconds,
+                source=excluded.source""",
+                (chat_id,message_id,str(local),ttl,source,
+                 int(datetime.now(timezone.utc).timestamp())))
+
+    try:
+        await watch_expiring_photos(
+            api_id=int(TELEGRAM_API_ID),api_hash=TELEGRAM_API_HASH,
+            session=TELEGRAM_SESSION,owner_id=int(BOT_OWNER_ID),
+            media_root=PHOTO_ARCHIVE_DIR,max_bytes=PHOTO_LIMIT_BYTES,
+            on_saved=on_saved)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log.error("MTProto watcher stopped: %s",type(exc).__name__)
+
+def mtproto_photo_for_message(chat_id,message_id):
+    with db() as c:
+        record=c.execute("""SELECT * FROM mtproto_photos
+            WHERE chat_id=? AND message_id=?""",(int(chat_id),int(message_id))).fetchone()
+    if not record:return None,None
+    local=Path(record["file_path"]).resolve()
+    if not local.is_relative_to(PHOTO_ARCHIVE_DIR.resolve()) or not local.is_file():
+        return record,None
+    return record,local
+
+def mtproto_saved_list():
+    with db() as c:
+        rows=c.execute("""SELECT chat_id,message_id,ttl_seconds,source,saved_at
+            FROM mtproto_photos ORDER BY saved_at DESC LIMIT 15""").fetchall()
+        total=c.execute("SELECT COUNT(*) AS n FROM mtproto_photos").fetchone()["n"]
+    if not rows:return "Пока нет сохранённых самоуничтожающихся фотографий через MTProto."
+    lines=[f"📷 Самоуничтожающихся фото: {total}. Последние:"]
+    for r in rows:
+        stamp=datetime.fromtimestamp(r["saved_at"],LOCAL_TZ).strftime("%d.%m %H:%M")
+        lines.append(f"{stamp} • чат {r['chat_id']} • ID {r['message_id']} • {r['source']}")
+    lines.append("Получить одно фото: /expiring_send CHAT_ID MESSAGE_ID")
+    return "\n".join(lines)
+
+def mtproto_status_text():
+    if not MT_PROTO_ENABLED:
+        return "MTProto: отключён. Бот работает через Bot API."
+    if not TELEGRAM_API_ID or not TELEGRAM_API_HASH or not TELEGRAM_SESSION:
+        return "MTProto: не настроен. Требуются TELEGRAM_API_ID, TELEGRAM_API_HASH и TELEGRAM_SESSION."
+    if MT_PROTO_TASK is not None and not MT_PROTO_TASK.done():
+        return "MTProto: задача мониторинга запущена. Проверка авторизации и входящих медиа выполняется внутри модуля."
+    return "MTProto: задача не запущена или остановилась. Проверь Railway Logs."
+
 def photo_archive_stats():
     with db() as c:
         row=c.execute("""SELECT COUNT(*) AS n,
@@ -361,7 +434,7 @@ def photo_archive_stats():
             COALESCE(SUM(is_ephemeral),0) AS expiring,
             COALESCE(SUM(CASE WHEN source='reply' THEN 1 ELSE 0 END),0) AS replies
             FROM archived_photos""").fetchone()
-    return (f"📷 Архив фотографий: {row['n']} шт., {row['bytes']/1024/1024:.1f} МБ.\n"
+    return (f"📷 Архив фотографий Bot API: {row['n']} шт., {row['bytes']/1024/1024:.1f} МБ.\n"
             f"Отмечено Telegram как исчезающие: {row['expiring']}.\n"
             f"Получены через ответы: {row['replies']}.\n"
             f"Папка: {PHOTO_ARCHIVE_DIR}")
@@ -431,17 +504,40 @@ async def handle_deleted_business_messages(event):
         for row in originals:
             body=row["text"] or ""
             path=archived_photo_for_message(row)
+            mt_record=None
+            if path is None:
+                mt_record,path=mtproto_photo_for_message(row["chat_id"],row["message_id"])
             if path is None and "[вложение: photo]" not in body and "самоуничтожающееся медиа" not in body:
                 continue
             if path is None:
-                await send_text(owner,f"📷 Фото из удалённого сообщения #{row['message_id']} не было сохранено или недоступно через Bot API.")
+                await send_text(owner,f"📷 Фото из удалённого сообщения #{row['message_id']} недоступно в архиве.")
+                continue
+            if mt_record is not None and mt_record["delivered_at"] is not None:
                 continue
             try:
                 await send_archived_photo(owner,row,path)
+                if mt_record is not None:
+                    with db() as c:
+                        c.execute("UPDATE mtproto_photos SET delivered_at=? WHERE chat_id=? AND message_id=?",
+                            (int(datetime.now(timezone.utc).timestamp()),row["chat_id"],row["message_id"]))
             except Exception as exc:
-                log.warning("Unable to send deleted photo %s: %s",
-                            row["message_id"],type(exc).__name__)
-                await send_text(owner,f"⚠️ Не удалось переслать сохранённое фото из сообщения #{row['message_id']}.")
+                log.warning("Unable to send deleted photo %s: %s",row["message_id"],type(exc).__name__)
+                await send_text(owner,f"⚠️ Не удалось переслать фото из сообщения #{row['message_id']}.")
+        for message_id in unseen:
+            photo_record,path=mtproto_photo_for_message((event.get("chat") or {}).get("id"),message_id)
+            if not photo_record or path is None or photo_record["delivered_at"] is not None:
+                continue
+            stub={"chat_id":photo_record["chat_id"],"message_id":message_id,
+                  "chat_title":(event.get("chat") or {}).get("first_name") or "Telegram",
+                  "sender_name":"Собеседник",
+                  "message_date":photo_record["saved_at"]}
+            try:
+                await send_archived_photo(owner,stub,path)
+                with db() as c:
+                    c.execute("UPDATE mtproto_photos SET delivered_at=? WHERE chat_id=? AND message_id=?",
+                        (int(datetime.now(timezone.utc).timestamp()),photo_record["chat_id"],message_id))
+            except Exception as exc:
+                log.warning("Unable to send MTProto photo %s: %s",message_id,type(exc).__name__)
     mark_deleted(event)
 
 def mark_deleted(x):
@@ -1062,7 +1158,7 @@ async def private_message(m):
         await send_text(chat_id,"Привет! Я Alexey AI. Отправь /id для настройки доступа." if not owner_ok(uid) else "Привет! Я на связи. Задай вопрос по архиву или отправь /help.");return
     if not owner_ok(uid):await send_text(chat_id,"Доступ закрыт. Владелец должен настроить BOT_OWNER_ID.");return
     if text.startswith("/help"):
-        await send_text(chat_id,"/status — состояние архива\n/deleted_on /deleted_off /deleted_status — журнал удалений\n/photo_stats — сколько фотографий сохранено\n/chats — список чатов и их ID\n/analysis_status — ход последнего анализа\n/analysis_progress ID [номер] — сохранённые фрагменты\n/analysis_export ID — все промежуточные резюме\n/analyze_chat ID — запросить анализ чата (с подтверждением)\n/report_chat ID — показать сохранённый анализ чата\n/import — инструкция импорта JSON\n/search запрос — поиск по сообщениям\n/report [YYYY-MM-DD] — ежедневный отчёт\n/analyze [YYYY-MM-DD] — повторный анализ дня (с подтверждением)\n/confirm КОД — подтвердить платный анализ\n/cancel — отменить ожидающий анализ\n/notes — общие заметки из интеграции\n/stats — статистика архива\n/usage — расход токенов API\n/recent ID — последние сообщения чата\n/search_chat ID запрос — поиск в одном чате\n/help — помощь\nМожно задавать вопросы обычным текстом.");return
+        await send_text(chat_id,"/status — состояние архива\n/deleted_on /deleted_off /deleted_status — журнал удалений\n/photo_stats — сколько фотографий сохранено\n/expiring_status /expiring_list /expiring_send — архив исчезающих фото\n/chats — список чатов и их ID\n/analysis_status — ход последнего анализа\n/analysis_progress ID [номер] — сохранённые фрагменты\n/analysis_export ID — все промежуточные резюме\n/analyze_chat ID — запросить анализ чата (с подтверждением)\n/report_chat ID — показать сохранённый анализ чата\n/import — инструкция импорта JSON\n/search запрос — поиск по сообщениям\n/report [YYYY-MM-DD] — ежедневный отчёт\n/analyze [YYYY-MM-DD] — повторный анализ дня (с подтверждением)\n/confirm КОД — подтвердить платный анализ\n/cancel — отменить ожидающий анализ\n/notes — общие заметки из интеграции\n/stats — статистика архива\n/usage — расход токенов API\n/recent ID — последние сообщения чата\n/search_chat ID запрос — поиск в одном чате\n/help — помощь\nМожно задавать вопросы обычным текстом.");return
     if text=="/deleted_on":
         set_deleted_alerts_enabled(True)
         await send_text(chat_id,"🗑 Уведомления об удалённых сообщениях включены.");return
@@ -1075,6 +1171,21 @@ async def private_message(m):
                         ".\nСохранённые фото отправляются только при удалении. Новые сообщения не пересылаются.");return
     if text=="/photo_stats":
         await send_text(chat_id,photo_archive_stats());return
+    if text=="/expiring_status":
+        await send_text(chat_id,mtproto_status_text());return
+    if text=="/expiring_list":
+        await send_long_text(chat_id,mtproto_saved_list());return
+    if text.startswith("/expiring_send"):
+        parts=text.split()
+        if len(parts)!=3 or not parts[1].lstrip("-").isdigit() or not parts[2].isdigit():
+            await send_text(chat_id,"Формат: /expiring_send CHAT_ID MESSAGE_ID");return
+        target_chat,target_message=int(parts[1]),int(parts[2])
+        record,path=mtproto_photo_for_message(target_chat,target_message)
+        if path is None:
+            await send_text(chat_id,"Фотография не найдена в архиве MTProto.");return
+        row={"chat_id":target_chat,"message_id":target_message,"chat_title":f"Чат {target_chat}",
+             "sender_name":"Собеседник","message_date":record["saved_at"]}
+        await send_archived_photo(chat_id,row,path);return
     if text.startswith("/notes"):
         with db() as c:
             notes=c.execute("SELECT subject,content,created_at FROM shared_notes ORDER BY id DESC LIMIT 10").fetchall()
@@ -1289,7 +1400,7 @@ async def integration_save_note(request:Request,authorization:str|None=Header(de
 async def health():return {"status":"ok","service":"alexey-telegram-ai","version":"0.3.0"}
 @app.on_event("startup")
 async def startup():
-    global DAILY_TASK
+    global DAILY_TASK,MT_PROTO_TASK
     init_db()
     if BOT_TOKEN and WEBHOOK_URL and WEBHOOK_SECRET:
         await telegram_api("setWebhook",{"url":f"{WEBHOOK_URL}/telegram/webhook","secret_token":WEBHOOK_SECRET,
@@ -1300,14 +1411,25 @@ async def startup():
     if DAILY_TASK is None or DAILY_TASK.done():
         DAILY_TASK=asyncio.create_task(daily_scheduler())
         log.info("Daily report scheduler started; timezone=%s; delivery=00:05",LOCAL_TZ.key)
+    if MT_PROTO_ENABLED:
+        if not (TELEGRAM_API_ID.isdigit() and TELEGRAM_API_HASH and TELEGRAM_SESSION and BOT_OWNER_ID.isdigit()):
+            log.warning("MTProto disabled: required authorized user-account settings are missing")
+        elif MT_PROTO_TASK is None or MT_PROTO_TASK.done():
+            MT_PROTO_TASK=asyncio.create_task(run_mtproto_archive())
+            log.info("Optional MTProto photo watcher task started")
 @app.on_event("shutdown")
 async def shutdown():
-    global DAILY_TASK
+    global DAILY_TASK,MT_PROTO_TASK
     if DAILY_TASK is not None:
         DAILY_TASK.cancel()
         try:await DAILY_TASK
         except asyncio.CancelledError:pass
         DAILY_TASK=None
+    if MT_PROTO_TASK is not None:
+        MT_PROTO_TASK.cancel()
+        try:await MT_PROTO_TASK
+        except asyncio.CancelledError:pass
+        MT_PROTO_TASK=None
 @app.post("/telegram/webhook")
 async def webhook(request:Request,x_telegram_bot_api_secret_token:str|None=Header(default=None)):
     if not WEBHOOK_SECRET or x_telegram_bot_api_secret_token!=WEBHOOK_SECRET:raise HTTPException(401,"Invalid webhook secret")
