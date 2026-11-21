@@ -288,5 +288,55 @@ class ExpiringPhotoTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(await app.archive_replied_business_photo(parent))
             archive.assert_not_awaited()
 
+
+class MTProtoIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ttl_photo_detection(self):
+        from types import SimpleNamespace
+        from mtproto_capture import is_ttl_photo
+        valid=SimpleNamespace(id=123,media=SimpleNamespace(ttl_seconds=2147483647,photo=object()))
+        no_ttl=SimpleNamespace(id=123,media=SimpleNamespace(ttl_seconds=None,photo=object()))
+        video=SimpleNamespace(id=123,media=SimpleNamespace(ttl_seconds=10,photo=None))
+        self.assertTrue(is_ttl_photo(valid))
+        self.assertFalse(is_ttl_photo(no_ttl))
+        self.assertFalse(is_ttl_photo(video))
+
+    async def test_deleted_unknown_message_uses_mtproto_photo(self):
+        app=app_module()
+        app.init_db()
+        app.set_deleted_alerts_enabled(True)
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(app,"PHOTO_ARCHIVE_DIR",Path(directory)), \
+             patch.object(app,"BOT_OWNER_ID","100"), \
+             patch.object(app,"send_long_text",new_callable=AsyncMock) as text_notice, \
+             patch.object(app,"send_archived_photo",new_callable=AsyncMock) as image_notice:
+            folder=Path(directory)/"mtproto"
+            folder.mkdir()
+            photo=folder/"sample.jpg"
+            photo.write_bytes(b"\xff\xd8fake\xff\xd9")
+            with app.db() as c:
+                c.execute("""INSERT OR REPLACE INTO mtproto_photos
+                    (chat_id,message_id,file_path,ttl_seconds,source,saved_at)
+                    VALUES(?,?,?,?,?,?)""",
+                    (936123,310,str(photo),2147483647,"reply",1790000000))
+            event={"business_connection_id":"missing-from-bot-api",
+                   "chat":{"id":936123,"first_name":"Private chat"},
+                   "message_ids":[310]}
+            await app.handle_deleted_business_messages(event)
+            image_notice.assert_awaited_once()
+            self.assertEqual(image_notice.await_args.args[1]["message_id"],310)
+            self.assertIsNotNone(app.mtproto_photo_for_message(936123,310)[1])
+            text_notice.assert_awaited_once()
+            with app.db() as c:
+                row=c.execute("SELECT delivered_at FROM mtproto_photos WHERE chat_id=? AND message_id=?",
+                              (936123,310)).fetchone()
+            self.assertIsNotNone(row["delivered_at"])
+            await app.handle_deleted_business_messages(event)
+            image_notice.assert_awaited_once()
+
+    async def test_status_disabled_by_default(self):
+        app=app_module()
+        with patch.object(app,"MT_PROTO_ENABLED",False):
+            self.assertIn("отключён",app.mtproto_status_text())
+
 if __name__=="__main__":
     unittest.main()
