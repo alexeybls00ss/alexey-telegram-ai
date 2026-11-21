@@ -649,7 +649,7 @@ async def private_message(m):
         await send_text(chat_id,"Привет! Я Alexey AI. Отправь /id для настройки доступа." if not owner_ok(uid) else "Привет! Я на связи. Задай вопрос по архиву или отправь /help.");return
     if not owner_ok(uid):await send_text(chat_id,"Доступ закрыт. Владелец должен настроить BOT_OWNER_ID.");return
     if text.startswith("/help"):
-        await send_text(chat_id,"/status — состояние архива\n/chats — список чатов и их ID\n/analyze_chat ID — анализ всей истории одного чата\n/report_chat ID — показать сохранённый анализ чата\n/import — инструкция импорта JSON\n/search запрос — поиск по сообщениям\n/report [YYYY-MM-DD] — ежедневный отчёт\n/analyze [YYYY-MM-DD] — повторный анализ дня\n/notes — общие заметки из интеграции\n/stats — статистика архива\n/usage — расход токенов API\n/recent ID — последние сообщения чата\n/search_chat ID запрос — поиск в одном чате\n/help — помощь\nМожно задавать вопросы обычным текстом.");return
+        await send_text(chat_id,"/status — состояние архива\n/chats — список чатов и их ID\n/analysis_progress ID [номер] — сохранённые фрагменты\n/analysis_export ID — все промежуточные резюме\n/analyze_chat ID — анализ всей истории одного чата\n/report_chat ID — показать сохранённый анализ чата\n/import — инструкция импорта JSON\n/search запрос — поиск по сообщениям\n/report [YYYY-MM-DD] — ежедневный отчёт\n/analyze [YYYY-MM-DD] — повторный анализ дня\n/notes — общие заметки из интеграции\n/stats — статистика архива\n/usage — расход токенов API\n/recent ID — последние сообщения чата\n/search_chat ID запрос — поиск в одном чате\n/help — помощь\nМожно задавать вопросы обычным текстом.");return
     if text.startswith("/notes"):
         with db() as c:
             notes=c.execute("SELECT subject,content,created_at FROM shared_notes ORDER BY id DESC LIMIT 10").fetchall()
@@ -694,6 +694,34 @@ async def private_message(m):
         return
     if text.startswith("/chats"):
         await send_long_text(chat_id,format_archived_chats());return
+    if text.startswith("/analysis_progress"):
+        parts=text.split()
+        if len(parts) not in (2,3) or not parts[1].isdigit() or (len(parts)==3 and (not parts[2].isdigit() or int(parts[2])<1)):
+            await send_text(chat_id,"Формат: /analysis_progress 7076188523 [номер_фрагмента]");return
+        target_id=int(parts[1])
+        with db() as c:
+            cached=c.execute("SELECT summary,created_at FROM analysis_chunk_cache WHERE chat_id=? ORDER BY created_at ASC,chunk_hash ASC",(target_id,)).fetchall()
+            count=c.execute("SELECT COUNT(*) AS n FROM messages WHERE chat_id=? AND deleted=0",(target_id,)).fetchone()["n"]
+        if not cached:
+            await send_text(chat_id,f"Чат {target_id}: в архиве {count} сообщений. Сохранённых промежуточных резюме пока нет. Это не доказывает, что анализ сейчас не выполняется.");return
+        if len(parts)==3:
+            index=int(parts[2])
+            if index>len(cached):
+                await send_text(chat_id,f"Сохранено только {len(cached)} фрагментов. Выбери номер от 1 до {len(cached)}.");return
+            item=cached[index-1]
+            await send_long_text(chat_id,f"Чат {target_id}. Фрагмент {index}/{len(cached)}.\n\n"+item["summary"]);return
+        await send_text(chat_id,f"Чат {target_id}: сообщений {count}; сохранённых фрагментов анализа: {len(cached)}.\nПоказать конкретный: /analysis_progress {target_id} 1\nВсе резюме: /analysis_export {target_id}\nКоличество фрагментов не показывает, выполняется ли анализ сейчас.");return
+    if text.startswith("/analysis_export"):
+        parts=text.split()
+        if len(parts)!=2 or not parts[1].isdigit():
+            await send_text(chat_id,"Формат: /analysis_export 7076188523");return
+        target_id=int(parts[1])
+        with db() as c:
+            cached=c.execute("SELECT summary FROM analysis_chunk_cache WHERE chat_id=? ORDER BY created_at ASC,chunk_hash ASC",(target_id,)).fetchall()
+        if not cached:
+            await send_text(chat_id,"Пока нет сохранённых фрагментов для этого чата.");return
+        output="Промежуточные результаты чата "+str(target_id)+"\n\n"+"\n\n".join("ФРАГМЕНТ "+str(i)+"\n"+row["summary"] for i,row in enumerate(cached,1))
+        await send_long_text(chat_id,output);return
     if text.startswith("/analyze_chat"):
         parts=text.split(maxsplit=1)
         if len(parts)<2 or not parts[1].strip().isdigit():
