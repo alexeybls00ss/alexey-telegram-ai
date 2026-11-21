@@ -56,6 +56,36 @@ class ArchiveSmokeTest(unittest.TestCase):
         self.assertEqual(saved["message_count"], 2)
         self.assertEqual(saved["chat_count"], 1)
 
+    def test_selected_private_chat_isolated(self):
+        main.init_db()
+        main.save_connection({
+            "id": "connection-contact-test",
+            "user": {"id": 100},
+            "is_enabled": True,
+            "rights": {},
+        })
+        now = int(datetime.now(timezone.utc).timestamp())
+        for chat_id, peer_id, msg_id, body in [
+            (7001, 7001, 11, "Сообщение в чате первого собеседника"),
+            (7001, 100, 12, "Ответ Алексея в том же чате"),
+            (7002, 7002, 21, "Сообщение другого собеседника"),
+        ]:
+            main.save_message({
+                "business_connection_id": "connection-contact-test",
+                "chat": {"id": chat_id, "title": f"Чат {chat_id}"},
+                "message_id": msg_id,
+                "date": now + msg_id,
+                "from": {"id": peer_id, "first_name": "Участник"},
+                "text": body,
+            })
+        selected = main.get_contact_messages(7001)
+        self.assertEqual(len(selected), 2)
+        self.assertEqual({row["chat_id"] for row in selected}, {7001})
+        self.assertIn("Ответ Алексея", selected[1]["text"])
+        self.assertEqual(main.get_contact_messages(7002)[0]["chat_id"], 7002)
+        self.assertIsNone(main.get_contact_report(7001))
+        self.assertIn("7001", main.format_archived_chats())
+
 
 if __name__ == "__main__":
     unittest.main()
