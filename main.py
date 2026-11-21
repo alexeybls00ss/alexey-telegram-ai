@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import difflib
 import secrets, contextvars, hashlib, hmac, html, json, logging, os, re, sqlite3
 from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta, timezone
@@ -88,6 +89,27 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_daily_chat_summaries_date ON daily_chat_summaries(report_date DESC)")
         c.execute("CREATE TABLE IF NOT EXISTS analysis_chunk_cache(chat_id INTEGER,chunk_hash TEXT,summary TEXT,created_at INTEGER,PRIMARY KEY(chat_id,chunk_hash))")
         c.execute("CREATE TABLE IF NOT EXISTS bot_settings(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
+        c.execute("""CREATE TABLE IF NOT EXISTS message_edits(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            update_id INTEGER UNIQUE,
+            connection_id TEXT NOT NULL,
+            chat_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            revision INTEGER NOT NULL,
+            chat_title TEXT,
+            sender_name TEXT,
+            sender_id INTEGER,
+            sent_at INTEGER,
+            edited_at INTEGER NOT NULL,
+            observed_at INTEGER NOT NULL,
+            before_text TEXT,
+            after_text TEXT NOT NULL,
+            notified_at INTEGER,
+            UNIQUE(connection_id,chat_id,message_id,revision))""")
+        c.execute("""CREATE INDEX IF NOT EXISTS idx_message_edits_chat
+            ON message_edits(chat_id,edited_at DESC,id DESC)""")
+        c.execute("""CREATE INDEX IF NOT EXISTS idx_message_edits_message
+            ON message_edits(connection_id,chat_id,message_id,revision)""")
         c.execute("""CREATE TABLE IF NOT EXISTS mtproto_photos(
             chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
             file_path TEXT NOT NULL, ttl_seconds INTEGER NOT NULL,
@@ -210,11 +232,42 @@ def save_connection(x):
         is_enabled=excluded.is_enabled,rights_json=excluded.rights_json,updated_at=excluded.updated_at""",
         (x.get("id",""),(x.get("user") or {}).get("id"),int(bool(x.get("is_enabled"))),
          json.dumps(x.get("rights") or {},ensure_ascii=False),int(datetime.now(timezone.utc).timestamp())))
-def save_message(m,edited=False):
+def save_message(m,edited=False,update_id=None):
+    """Maintain the current message and, for edits, append an immutable revision.
+
+    The two writes share a transaction. update_id prevents a Telegram retry
+    from creating duplicate versions or falsely treating the new text as old.
+    """
     cid=m.get("business_connection_id"); chat=m.get("chat") or {}; sender=m.get("from") or {}
     if not cid or chat.get("id") is None or m.get("message_id") is None:
-        log.warning("Skipping incomplete business message"); return
+        log.warning("Skipping incomplete business message"); return None
+    chat_id=chat["id"]; mid=m["message_id"]
+    new_text=message_text(m)
+    chat_title=(chat.get("title") or chat.get("first_name") or chat.get("username") or "Личный чат")
+    sender_name=person_name(sender) or ("Алексей" if m.get("sender_business_bot") else "Неизвестно")
+    now=int(datetime.now(timezone.utc).timestamp())
+    sent_at=int(m.get("date") or now)
+    edit_id=None
     with db() as c:
+        if edited and update_id is not None:
+            existing=c.execute("SELECT id FROM message_edits WHERE update_id=?",(int(update_id),)).fetchone()
+            if existing:return existing["id"]
+        old=c.execute("""SELECT text FROM messages
+            WHERE connection_id=? AND chat_id=? AND message_id=?""",
+            (cid,chat_id,mid)).fetchone() if edited else None
+        if edited:
+            previous=old["text"] if old is not None else None
+            rev=c.execute("""SELECT COALESCE(MAX(revision),0)+1 AS rev FROM message_edits
+                WHERE connection_id=? AND chat_id=? AND message_id=?""",
+                (cid,chat_id,mid)).fetchone()["rev"]
+            edited_at=int(m.get("edit_date") or now)
+            cur=c.execute("""INSERT INTO message_edits
+                (update_id,connection_id,chat_id,message_id,revision,chat_title,
+                 sender_name,sender_id,sent_at,edited_at,observed_at,before_text,after_text)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (int(update_id) if update_id is not None else None,cid,chat_id,mid,rev,
+                 chat_title,sender_name,sender.get("id"),sent_at,edited_at,now,previous,new_text))
+            edit_id=cur.lastrowid
         c.execute("""INSERT INTO messages(connection_id,chat_id,message_id,chat_title,chat_username,
         sender_id,sender_name,sender_username,message_date,text,edited,deleted,sender_is_business_bot)
         VALUES(?,?,?,?,?,?,?,?,?,?,?,0,?)
@@ -223,10 +276,10 @@ def save_message(m,edited=False):
         sender_username=excluded.sender_username,message_date=excluded.message_date,text=excluded.text,
         edited=MAX(messages.edited,excluded.edited),deleted=0,
         sender_is_business_bot=excluded.sender_is_business_bot""",
-        (cid,chat["id"],m["message_id"],chat.get("title") or chat.get("first_name") or chat.get("username") or "Личный чат",
-         chat.get("username"),sender.get("id"),person_name(sender) or ("Алексей" if m.get("sender_business_bot") else "Неизвестно"),
-         sender.get("username"),int(m.get("date") or datetime.now(timezone.utc).timestamp()),
-         message_text(m),int(edited),int(bool(m.get("sender_business_bot")))))
+        (cid,chat_id,mid,chat_title,chat.get("username"),sender.get("id"),sender_name,
+         sender.get("username"),sent_at,new_text,int(edited),int(bool(m.get("sender_business_bot")))))
+    return edit_id
+
 def photo_archive_path(connection_id,chat_id,message_id):
     # Hash opaque IDs so the filenames reveal no chat IDs or names.
     key=f"{connection_id}:{chat_id}:{message_id}".encode("utf-8")
@@ -438,6 +491,119 @@ def photo_archive_stats():
             f"Отмечено Telegram как исчезающие: {row['expiring']}.\n"
             f"Получены через ответы: {row['replies']}.\n"
             f"Папка: {PHOTO_ARCHIVE_DIR}")
+
+def edit_alerts_enabled():
+    with db() as c:
+        row=c.execute("SELECT value FROM bot_settings WHERE key='edit_alerts'").fetchone()
+    return row["value"]!="0" if row else True
+
+def set_edit_alerts_enabled(enabled):
+    with db() as c:
+        c.execute("""INSERT INTO bot_settings(key,value) VALUES('edit_alerts',?)
+                     ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                  ("1" if enabled else "0",))
+
+def get_edit_revision(edit_id):
+    with db() as c:
+        return c.execute("SELECT * FROM message_edits WHERE id=?",(int(edit_id),)).fetchone()
+
+def edit_diff_html(old,new,limit=420):
+    """HTML-safe word-level delta: strike removals, underline additions."""
+    if old is None:return "<i>Предыдущая версия неизвестна.</i>"
+    old=old[:limit];new=new[:limit]
+    a=re.findall(r"\s+|[^\s]+",old)
+    b=re.findall(r"\s+|[^\s]+",new)
+    out=[]
+    for operation,i,j,x,y in difflib.SequenceMatcher(None,a,b,autojunk=False).get_opcodes():
+        if operation=="equal":out.append(html.escape("".join(a[i:j])))
+        elif operation=="delete":out.append("<s>"+html.escape("".join(a[i:j]))+"</s>")
+        elif operation=="insert":out.append("<b><u>"+html.escape("".join(b[x:y]))+"</u></b>")
+        else:
+            if i!=j:out.append("<s>"+html.escape("".join(a[i:j]))+"</s>")
+            if x!=y:out.append("<b><u>"+html.escape("".join(b[x:y]))+"</u></b>")
+    return "".join(out) or "<i>Текст не изменился (возможно, изменилось вложение).</i>"
+
+def edit_notification_html(row):
+    original=datetime.fromtimestamp(row["sent_at"] or row["observed_at"],LOCAL_TZ).strftime("%d.%m.%Y %H:%M")
+    edited=datetime.fromtimestamp(row["edited_at"],LOCAL_TZ).strftime("%d.%m.%Y %H:%M")
+    heading=(f"✏️ <b>Сообщение отредактировано</b>\n"
+             f"<b>Чат:</b> {html.escape(row['chat_title'] or str(row['chat_id']))}\n"
+             f"<b>От:</b> {html.escape(row['sender_name'] or 'Неизвестно')}\n"
+             f"<b>Отправлено:</b> {original}\n"
+             f"<b>Изменено:</b> {edited}\n"
+             f"<b>ID:</b> {row['message_id']} • <b>Редакция №{row['revision']}</b>")
+    def body_chars(n):
+        before=("<s>"+html.escape(row["before_text"][:n])+"</s>") if row["before_text"] is not None \
+            else "<i>Исходное сообщение не было получено ботом.</i>"
+        after=html.escape(row["after_text"][:n])
+        return (f"{heading}\n\n<b>БЫЛО</b>\n{before}\n\n<b>СТАЛО</b>\n{after}\n\n"
+                f"<b>Изменения</b>\n{edit_diff_html(row['before_text'],row['after_text'],min(n,420))}\n\n"
+                f"История: /edit_history {row['chat_id']} {row['message_id']}")
+    message=body_chars(640)
+    if len(message)>3800:message=body_chars(220)
+    if len(message)>3800:message=heading+"\n\nСообщение слишком длинное. Полный текст: /edit_history "+str(row["chat_id"])+" "+str(row["message_id"])
+    return message
+
+async def notify_edit(edit_id):
+    row=get_edit_revision(edit_id)
+    if row is None or row["notified_at"] is not None:return
+    if not BOT_OWNER_ID.isdigit() or not edit_alerts_enabled():
+        with db() as c:
+            c.execute("UPDATE message_edits SET notified_at=? WHERE id=? AND notified_at IS NULL",
+                      (int(datetime.now(timezone.utc).timestamp()),int(edit_id)))
+        return
+    try:
+        await telegram_api("sendMessage",{
+            "chat_id":int(BOT_OWNER_ID),
+            "text":edit_notification_html(row),
+            "parse_mode":"HTML"})
+    except Exception:
+        log.warning("Rich edit notification failed, trying plain text",exc_info=True)
+        prior=row["before_text"] if row["before_text"] is not None else "[Предыдущая версия неизвестна]"
+        await send_long_text(int(BOT_OWNER_ID),
+            f"✏️ Изменено сообщение #{row['message_id']} в чате {row['chat_title'] or row['chat_id']}\n"
+            f"БЫЛО:\n{prior}\nСТАЛО:\n{row['after_text']}\n"
+            f"/edit_history {row['chat_id']} {row['message_id']}")
+    with db() as c:
+        c.execute("UPDATE message_edits SET notified_at=? WHERE id=? AND notified_at IS NULL",
+                  (int(datetime.now(timezone.utc).timestamp()),int(edit_id)))
+
+def list_recent_edits(chat_id,page=1):
+    page=max(1,min(int(page),10000))
+    size=12
+    with db() as c:
+        count=c.execute("SELECT COUNT(*) AS n FROM message_edits WHERE chat_id=?",(int(chat_id),)).fetchone()["n"]
+        rows=c.execute("""SELECT * FROM message_edits WHERE chat_id=?
+            ORDER BY edited_at DESC,id DESC LIMIT ? OFFSET ?""",
+            (int(chat_id),size,(page-1)*size)).fetchall()
+    if not rows:return f"✏️ Редактирования для чата {chat_id} не найдены (страница {page})."
+    lines=[f"✏️ История изменений • чат {chat_id}",
+           f"Всего редактирований: {count} • Страница {page}/{(count+size-1)//size}"]
+    for row in rows:
+        stamp=datetime.fromtimestamp(row["edited_at"],LOCAL_TZ).strftime("%d.%m.%Y %H:%M")
+        preview=row["after_text"].replace("\n"," ")[:110]
+        lines.append(f"\n{stamp} • {row['sender_name'] or 'Неизвестно'} • #{row['message_id']} "
+                     f"(редакция {row['revision']})\n{preview}\n"
+                     f"/edit_history {chat_id} {row['message_id']}")
+    lines.append(f"\nДругая страница: /edits {chat_id} {page+1}")
+    return "\n".join(lines)
+
+def message_edit_history(chat_id,message_id):
+    with db() as c:
+        rows=c.execute("""SELECT * FROM message_edits WHERE chat_id=? AND message_id=?
+            ORDER BY id,revision""",(int(chat_id),int(message_id))).fetchall()
+    if not rows:return "Редактирования этого сообщения не найдены."
+    lines=[f"✏️ Все редакции • чат {chat_id} • сообщение #{message_id}",
+           f"Записано изменений: {len(rows)}"]
+    for row in rows:
+        stamp=datetime.fromtimestamp(row["edited_at"],LOCAL_TZ).strftime("%d.%m.%Y %H:%M")
+        lines.append(f"\n--- Редакция №{row['revision']} • {stamp} ---")
+        if row["revision"]==1:
+            lines.append("Исходная версия:\n"+(
+                row["before_text"] if row["before_text"] is not None
+                else "[Исходное сообщение не было получено ботом]"))
+        lines.append("Новая версия:\n"+row["after_text"])
+    return "\n".join(lines)
 
 def deleted_alerts_enabled():
     """User setting for deletion notifications. Does not affect chat archiving."""
@@ -1158,7 +1324,28 @@ async def private_message(m):
         await send_text(chat_id,"Привет! Я Alexey AI. Отправь /id для настройки доступа." if not owner_ok(uid) else "Привет! Я на связи. Задай вопрос по архиву или отправь /help.");return
     if not owner_ok(uid):await send_text(chat_id,"Доступ закрыт. Владелец должен настроить BOT_OWNER_ID.");return
     if text.startswith("/help"):
-        await send_text(chat_id,"/status — состояние архива\n/deleted_on /deleted_off /deleted_status — журнал удалений\n/photo_stats — сколько фотографий сохранено\n/expiring_status /expiring_list /expiring_send — архив исчезающих фото\n/chats — список чатов и их ID\n/analysis_status — ход последнего анализа\n/analysis_progress ID [номер] — сохранённые фрагменты\n/analysis_export ID — все промежуточные резюме\n/analyze_chat ID — запросить анализ чата (с подтверждением)\n/report_chat ID — показать сохранённый анализ чата\n/import — инструкция импорта JSON\n/search запрос — поиск по сообщениям\n/report [YYYY-MM-DD] — ежедневный отчёт\n/analyze [YYYY-MM-DD] — повторный анализ дня (с подтверждением)\n/confirm КОД — подтвердить платный анализ\n/cancel — отменить ожидающий анализ\n/notes — общие заметки из интеграции\n/stats — статистика архива\n/usage — расход токенов API\n/recent ID — последние сообщения чата\n/search_chat ID запрос — поиск в одном чате\n/help — помощь\nМожно задавать вопросы обычным текстом.");return
+        await send_text(chat_id,"/status — состояние архива\n/deleted_on /deleted_off /deleted_status — журнал удалений\n/edits_on /edits_off /edits_status — уведомления об изменениях\n/edits ID [страница] — изменения в чате\n/edit_history ID MESSAGE_ID — все версии сообщения\n/photo_stats — сколько фотографий сохранено\n/expiring_status /expiring_list /expiring_send — архив исчезающих фото\n/chats — список чатов и их ID\n/analysis_status — ход последнего анализа\n/analysis_progress ID [номер] — сохранённые фрагменты\n/analysis_export ID — все промежуточные резюме\n/analyze_chat ID — запросить анализ чата (с подтверждением)\n/report_chat ID — показать сохранённый анализ чата\n/import — инструкция импорта JSON\n/search запрос — поиск по сообщениям\n/report [YYYY-MM-DD] — ежедневный отчёт\n/analyze [YYYY-MM-DD] — повторный анализ дня (с подтверждением)\n/confirm КОД — подтвердить платный анализ\n/cancel — отменить ожидающий анализ\n/notes — общие заметки из интеграции\n/stats — статистика архива\n/usage — расход токенов API\n/recent ID — последние сообщения чата\n/search_chat ID запрос — поиск в одном чате\n/help — помощь\nМожно задавать вопросы обычным текстом.");return
+    if text=="/edits_on":
+        set_edit_alerts_enabled(True)
+        await send_text(chat_id,"✏️ Уведомления об изменениях включены. Каждая версия сохраняется.");return
+    if text=="/edits_off":
+        set_edit_alerts_enabled(False)
+        await send_text(chat_id,"🔕 Уведомления об изменениях выключены. История версий продолжает сохраняться.");return
+    if text=="/edits_status":
+        with db() as c:
+            count=c.execute("SELECT COUNT(*) AS n FROM message_edits").fetchone()["n"]
+        await send_text(chat_id,"✏️ Журнал редактирований: "+("уведомления включены" if edit_alerts_enabled() else "уведомления отключены")+
+                        f".\nСохранено изменений: {count}.");return
+    if text.startswith("/edit_history"):
+        args=text.split()
+        if len(args)!=3 or not args[1].lstrip("-").isdigit() or not args[2].isdigit():
+            await send_text(chat_id,"Формат: /edit_history CHAT_ID MESSAGE_ID");return
+        await send_long_text(chat_id,message_edit_history(int(args[1]),int(args[2])));return
+    if text.startswith("/edits"):
+        args=text.split()
+        if len(args) not in (2,3) or not args[1].lstrip("-").isdigit() or (len(args)==3 and not args[2].isdigit()):
+            await send_text(chat_id,"Формат: /edits CHAT_ID [страница]");return
+        await send_long_text(chat_id,list_recent_edits(int(args[1]),int(args[2]) if len(args)==3 else 1));return
     if text=="/deleted_on":
         set_deleted_alerts_enabled(True)
         await send_text(chat_id,"🗑 Уведомления об удалённых сообщениях включены.");return
@@ -1444,9 +1631,11 @@ async def webhook(request:Request,x_telegram_bot_api_secret_token:str|None=Heade
             await archive_business_photo(update["business_message"])
             await archive_replied_business_photo(update["business_message"])
         elif "edited_business_message" in update:
-            save_message(update["edited_business_message"],True)
+            edit_id=save_message(update["edited_business_message"],True,update_id=update_id)
             await archive_business_photo(update["edited_business_message"])
             await archive_replied_business_photo(update["edited_business_message"])
+            if edit_id is not None:
+                await notify_edit(edit_id)
         elif "deleted_business_messages" in update:
             await handle_deleted_business_messages(update["deleted_business_messages"])
         elif "message" in update:await private_message(update["message"])
