@@ -1,5 +1,6 @@
 from __future__ import annotations
-import asyncio, contextvars, hashlib, hmac, json, logging, os, re, sqlite3
+import asyncio
+import secrets, contextvars, hashlib, hmac, json, logging, os, re, sqlite3
 from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -26,6 +27,8 @@ ANALYSIS_BUDGET_USD=float(os.getenv("ANALYSIS_BUDGET_USD","0.10"))
 INPUT_PRICE_PER_M=float(os.getenv("INPUT_PRICE_PER_M","0.75"))
 OUTPUT_PRICE_PER_M=float(os.getenv("OUTPUT_PRICE_PER_M","4.50"))
 ACTIVE_ANALYSIS_BUDGET=contextvars.ContextVar("analysis_budget",default=None)
+PENDING_ANALYSES={}
+AUTO_DAILY_ANALYSIS=os.getenv("AUTO_DAILY_ANALYSIS","false").lower() in ("true","1","yes")
 class AnalysisBudgetExceeded(RuntimeError): pass
 DAILY_TASK=None
 app=FastAPI(title="Alexey Telegram AI",version="0.3.0")
@@ -569,7 +572,11 @@ def mark_report_sent(report_date):
 async def generate_and_deliver(day,chat_id,force=False):
     try:
         async with REPORT_LOCK:
-            report=await generate_daily_report(day,force=force)
+            token=ACTIVE_ANALYSIS_BUDGET.set({"limit":ANALYSIS_BUDGET_USD,"spent":0.0})
+            try:
+                report=await generate_daily_report(day,force=force)
+            finally:
+                ACTIVE_ANALYSIS_BUDGET.reset(token)
         await send_long_text(chat_id,report);mark_report_sent(day.isoformat())
     except Exception as e:
         log.exception("Manual daily report failed")
@@ -583,7 +590,7 @@ async def daily_scheduler():
                 saved=get_daily_report(key)
                 if saved is None:
                     async with REPORT_LOCK:
-                        if get_daily_report(key) is None:await generate_daily_report(target,force=False)
+                        if AUTO_DAILY_ANALYSIS and get_daily_report(key) is None:await generate_daily_report(target,force=False)
                     saved=get_daily_report(key)
                 if saved is not None and saved["sent_at"] is None:
                     await send_long_text(int(BOT_OWNER_ID),saved["content"]);mark_report_sent(key)
@@ -649,7 +656,7 @@ async def private_message(m):
         await send_text(chat_id,"Привет! Я Alexey AI. Отправь /id для настройки доступа." if not owner_ok(uid) else "Привет! Я на связи. Задай вопрос по архиву или отправь /help.");return
     if not owner_ok(uid):await send_text(chat_id,"Доступ закрыт. Владелец должен настроить BOT_OWNER_ID.");return
     if text.startswith("/help"):
-        await send_text(chat_id,"/status — состояние архива\n/chats — список чатов и их ID\n/analysis_progress ID [номер] — сохранённые фрагменты\n/analysis_export ID — все промежуточные резюме\n/analyze_chat ID — анализ всей истории одного чата\n/report_chat ID — показать сохранённый анализ чата\n/import — инструкция импорта JSON\n/search запрос — поиск по сообщениям\n/report [YYYY-MM-DD] — ежедневный отчёт\n/analyze [YYYY-MM-DD] — повторный анализ дня\n/notes — общие заметки из интеграции\n/stats — статистика архива\n/usage — расход токенов API\n/recent ID — последние сообщения чата\n/search_chat ID запрос — поиск в одном чате\n/help — помощь\nМожно задавать вопросы обычным текстом.");return
+        await send_text(chat_id,"/status — состояние архива\n/chats — список чатов и их ID\n/analysis_progress ID [номер] — сохранённые фрагменты\n/analysis_export ID — все промежуточные резюме\n/analyze_chat ID — запросить анализ чата (с подтверждением)\n/report_chat ID — показать сохранённый анализ чата\n/import — инструкция импорта JSON\n/search запрос — поиск по сообщениям\n/report [YYYY-MM-DD] — ежедневный отчёт\n/analyze [YYYY-MM-DD] — повторный анализ дня (с подтверждением)\n/confirm КОД — подтвердить платный анализ\n/cancel — отменить ожидающий анализ\n/notes — общие заметки из интеграции\n/stats — статистика архива\n/usage — расход токенов API\n/recent ID — последние сообщения чата\n/search_chat ID запрос — поиск в одном чате\n/help — помощь\nМожно задавать вопросы обычным текстом.");return
     if text.startswith("/notes"):
         with db() as c:
             notes=c.execute("SELECT subject,content,created_at FROM shared_notes ORDER BY id DESC LIMIT 10").fetchall()
@@ -722,13 +729,34 @@ async def private_message(m):
             await send_text(chat_id,"Пока нет сохранённых фрагментов для этого чата.");return
         output="Промежуточные результаты чата "+str(target_id)+"\n\n"+"\n\n".join("ФРАГМЕНТ "+str(i)+"\n"+row["summary"] for i,row in enumerate(cached,1))
         await send_long_text(chat_id,output);return
+    if text.startswith("/cancel"):
+        PENDING_ANALYSES.pop(int(uid),None)
+        await send_text(chat_id,"Ожидающий анализ отменён.");return
+    if text.startswith("/confirm"):
+        parts=text.split()
+        pending=PENDING_ANALYSES.get(int(uid))
+        if not pending or len(parts)!=2 or not secrets.compare_digest(parts[1],pending["code"]):
+            await send_text(chat_id,"Нет подходящего запроса. Сначала отправь /analyze_chat ID или /analyze YYYY-MM-DD.");return
+        if datetime.now(timezone.utc).timestamp()-pending["created"]>600:
+            PENDING_ANALYSES.pop(int(uid),None)
+            await send_text(chat_id,"Подтверждение устарело (10 минут). Создай запрос заново.");return
+        PENDING_ANALYSES.pop(int(uid),None)
+        if pending["kind"]=="chat":
+            await send_text(chat_id,"Подтверждено. Запускаю анализ чата "+str(pending["value"])+".")
+            asyncio.create_task(generate_and_deliver_contact(pending["value"],chat_id))
+        else:
+            target=date.fromisoformat(pending["value"])
+            await send_text(chat_id,"Подтверждено. Запускаю повторный анализ дня "+target.isoformat()+".")
+            asyncio.create_task(generate_and_deliver(target,chat_id,force=True))
+        return
     if text.startswith("/analyze_chat"):
         parts=text.split(maxsplit=1)
         if len(parts)<2 or not parts[1].strip().isdigit():
             await send_text(chat_id,"Формат: /analyze_chat 7076188523\nСписок сохранённых чатов: /chats");return
         target_id=int(parts[1].strip())
-        await send_text(chat_id,f"Начал анализ всей сохранённой истории чата ID {target_id}. Это может занять некоторое время; пришлю результат сюда.")
-        asyncio.create_task(generate_and_deliver_contact(target_id,chat_id));return
+        code=secrets.token_hex(3)
+        PENDING_ANALYSES[int(uid)]={"kind":"chat","value":target_id,"code":code,"created":datetime.now(timezone.utc).timestamp()}
+        await send_text(chat_id,f"Запрос анализа чата {target_id}. Оценочный лимит на запуск: ${ANALYSIS_BUDGET_USD:.2f} (не гарантированный предел списания). Подтвердить в течение 10 минут: /confirm {code}\nОтмена: /cancel");return
     if text.startswith("/report_chat"):
         parts=text.split(maxsplit=1)
         if len(parts)<2 or not parts[1].strip().isdigit():
@@ -754,15 +782,16 @@ async def private_message(m):
         try:target=date.fromisoformat(parts[1].strip()) if len(parts)>1 else (datetime.now(LOCAL_TZ).date()-timedelta(days=1))
         except ValueError:
             await send_text(chat_id,"Укажи дату в формате YYYY-MM-DD. Например: /analyze 2026-11-20");return
-        await send_text(chat_id,f"Начал анализ переписок за {target.isoformat()}. Пришлю отчёт отдельным сообщением.")
-        asyncio.create_task(generate_and_deliver(target,chat_id,force=True));return
+        code=secrets.token_hex(3)
+        PENDING_ANALYSES[int(uid)]={"kind":"day","value":target.isoformat(),"code":code,"created":datetime.now(timezone.utc).timestamp()}
+        await send_text(chat_id,f"Запрос повторного анализа всех чатов за {target.isoformat()}. Оценочный лимит: ${ANALYSIS_BUDGET_USD:.2f} (не гарантированный предел списания). Подтвердить в течение 10 минут: /confirm {code}\nОтмена: /cancel");return
     if text.startswith("/status"):
         with db() as c:
             n=c.execute("SELECT COUNT(*) FROM messages WHERE deleted=0").fetchone()[0]
             chats=c.execute("SELECT COUNT(DISTINCT chat_id) FROM messages WHERE deleted=0").fetchone()[0]
             active=c.execute("SELECT COUNT(*) FROM business_connections WHERE is_enabled=1").fetchone()[0]
         latest=get_latest_report_date()
-        await send_text(chat_id,f"Архив работает.\nСообщений: {n}\nЧатов: {chats}\nАктивных Business-подключений: {active}\nПоследний ежедневный отчёт: {latest or 'ещё не создан'}\nЧасовой пояс отчётов: Europe/Istanbul\nМодель: {OPENAI_MODEL}");return
+        await send_text(chat_id,f"Архив работает.\nСообщений: {n}\nЧатов: {chats}\nАктивных Business-подключений: {active}\nПоследний ежедневный отчёт: {latest or 'ещё не создан'}\nЧасовой пояс отчётов: {LOCAL_TZ.key}\nМодель: {OPENAI_MODEL}");return
     if text.startswith("/search"):
         q=text[len("/search"):].strip()
         if not q:await send_text(chat_id,"Пример: /search подарок новый год");return
