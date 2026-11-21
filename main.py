@@ -32,7 +32,6 @@ JOB_LAST_EDIT={}
 
 PENDING_ANALYSES={}
 AUTO_DAILY_ANALYSIS=os.getenv("AUTO_DAILY_ANALYSIS","true").lower() in ("true","1","yes")
-MIRROR_DEFAULT=os.getenv("MIRROR_DEFAULT","true").lower() in ("true","1","yes")
 class AnalysisBudgetExceeded(RuntimeError): pass
 DAILY_TASK=None
 app=FastAPI(title="Alexey Telegram AI",version="0.3.0")
@@ -192,150 +191,72 @@ def save_message(m,edited=False):
          chat.get("username"),sender.get("id"),person_name(sender) or ("Алексей" if m.get("sender_business_bot") else "Неизвестно"),
          sender.get("username"),int(m.get("date") or datetime.now(timezone.utc).timestamp()),
          message_text(m),int(edited),int(bool(m.get("sender_business_bot")))))
-def mirror_enabled():
+def deleted_alerts_enabled():
+    """User setting for deletion notifications. Does not affect chat archiving."""
     with db() as c:
-        row=c.execute("SELECT value FROM bot_settings WHERE key='mirror_enabled'").fetchone()
-    return row["value"]=="1" if row else MIRROR_DEFAULT
+        row=c.execute("SELECT value FROM bot_settings WHERE key='deleted_alerts'").fetchone()
+    return row["value"]!="0" if row else True
 
-def set_mirror_enabled(enabled):
+def set_deleted_alerts_enabled(enabled):
     with db() as c:
-        c.execute("""INSERT INTO bot_settings(key,value) VALUES('mirror_enabled',?)
+        c.execute("""INSERT INTO bot_settings(key,value) VALUES('deleted_alerts',?)
                      ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
                   ("1" if enabled else "0",))
 
-def is_expiring_photo(message):
-    """Telegram may expose TTL/view-once markers in some update formats."""
-    if not isinstance(message,dict) or not message.get("photo"):return False
-    candidates=[message,message.get("media"),message.get("photo_info")]
-    for item in candidates:
-        if not isinstance(item,dict):continue
-        for key in ("view_once","is_one_time","one_time","self_destruct","is_view_once"):
-            if item.get(key) is True:return True
-        for key in ("ttl_seconds","media_ttl_seconds"):
-            value=item.get(key)
-            if type(value) is int and value>0:return True
-    return False
+def get_deleted_message_snapshot(event):
+    """Get previously received originals before marking them deleted.
 
-async def copy_photo_to_owner(file_id,caption,owner_id):
-    """Re-upload via RAM so the copy is independent of the original file_id.
-
-    No media bytes or downloaded file paths are stored in SQLite or on disk.
-    If the Bot API doesn't permit downloading, try sending by file_id.
+    Telegram's deletion update provides IDs, not original content. Existing
+    message records are sufficient; no additional media storage is created.
     """
-    if not file_id:return False
-    caption=caption[:980]
-    try:
-        info=await telegram_api("getFile",{"file_id":file_id})
-        size=int(info.get("file_size") or 0)
-        path=info.get("file_path")
-        max_bytes=10*1024*1024
-        if path and size<=max_bytes:
-            url=f"https://api.telegram.org/file/bot{BOT_TOKEN}/{path.lstrip('/')}"
-            data=bytearray()
-            async with httpx.AsyncClient(timeout=40) as client:
-                async with client.stream("GET",url) as result:
-                    result.raise_for_status()
-                    async for chunk in result.aiter_bytes():
-                        data.extend(chunk)
-                        if len(data)>max_bytes:
-                            raise ValueError("Photo exceeds Telegram sendPhoto upload size")
-                result=await client.post(
-                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
-                    data={"chat_id":str(owner_id),"caption":caption},
-                    files={"photo":("photo.jpg",bytes(data),"image/jpeg")})
-                result.raise_for_status()
-                if (result.json() or {}).get("ok"):
-                    return True
-    except Exception as exc:
-        # Never log authenticated URLs, raw media, file IDs, or the image.
-        log.info("In-memory photo transfer unavailable: %s",type(exc).__name__)
-    try:
-        await telegram_api("sendPhoto",
-            {"chat_id":owner_id,"photo":file_id,"caption":caption})
-        return True
-    except Exception as exc:
-        log.warning("Photo is not accessible through Bot API: %s",type(exc).__name__)
-        return False
+    cid=event.get("business_connection_id")
+    chat_id=(event.get("chat") or {}).get("id")
+    ids=list(dict.fromkeys(i for i in event.get("message_ids",[]) if type(i) is int))
+    if not cid or chat_id is None or not ids:return [],[]
+    placeholders=",".join("?" for _ in ids)
+    with db() as c:
+        existing=c.execute(f"""SELECT m.*,b.user_id AS owner_user_id
+            FROM messages m LEFT JOIN business_connections b
+              ON b.connection_id=m.connection_id
+            WHERE m.connection_id=? AND m.chat_id=? AND m.message_id IN ({placeholders})""",
+            (cid,chat_id,*ids)).fetchall()
+    originals={row["message_id"]:row for row in existing}
+    newly_deleted=[originals[i] for i in ids if i in originals and not originals[i]["deleted"]]
+    unseen=[i for i in ids if i not in originals]
+    return newly_deleted,unseen
 
-async def maybe_copy_replied_photo(message):
-    """A Business-account reply can include the original media in reply_to_message.
+def deleted_notice(event,originals,unseen):
+    chat=event.get("chat") or {}
+    title=(chat.get("title") or " ".join(filter(None,(chat.get("first_name"),chat.get("last_name"))))
+           or chat.get("username") or (originals[0]["chat_title"] if originals else None)
+           or "Неизвестный чат")
+    stamp=datetime.now(LOCAL_TZ).strftime("%d.%m.%Y %H:%M:%S")
+    lines=[f"🗑 УДАЛЕНО СООБЩЕНИЕ • {title}" if len(originals)+len(unseen)==1
+           else f"🗑 УДАЛЕНЫ СООБЩЕНИЯ • {title}",
+           f"Чат ID: {chat.get('id')}",
+           f"Удалено: {stamp} ({LOCAL_TZ.key})"]
+    for row in originals:
+        original_time=datetime.fromtimestamp(row["message_date"],LOCAL_TZ).strftime("%d.%m.%Y %H:%M")
+        author=message_author(row)
+        text=row["text"] or "[Текст не был получен]"
+        lines.append(f"\nСообщение #{row['message_id']}\n"
+                     f"Автор: {author}\nОтправлено: {original_time}\n"
+                     f"Содержимое:\n{text}")
+    for mid in unseen:
+        lines.append(f"\nСообщение #{mid}\n"
+                     "Содержимое неизвестно: бот не получил исходное сообщение до удаления.")
+    return "\n".join(lines)
 
-    The /save_once reply must be sent BEFORE opening an expiring photo.
+async def handle_deleted_business_messages(event):
+    """Notify only on deletion, then update existing archive state.
+
+    Await notification before updating the deletion marker: a temporary
+    Telegram API failure leaves the update retryable.
     """
-    if not BOT_OWNER_ID.isdigit() or not mirror_enabled():return
-    sender=message.get("from") or {}
-    if sender.get("id")!=int(BOT_OWNER_ID):return
-    command=(message.get("text") or "").strip().split(" ",1)[0].lower()
-    original=message.get("reply_to_message") or {}
-    if not isinstance(original,dict):original={}
-    if command!="/save_once" and not is_expiring_photo(original):return
-    if original.get("has_protected_content"):
-        await send_text(int(BOT_OWNER_ID),"🔒 Медиа в ответе защищено от копирования.")
-        return
-    photos=original.get("photo") or []
-    if not isinstance(photos,list) or not photos:
-        if command=="/save_once":
-            await send_text(int(BOT_OWNER_ID),
-                "⚠️ Telegram не передал фото в reply_to_message. Через Bot API скачать его нельзя.")
-        return
-    if (original.get("from") or {}).get("id")==int(BOT_OWNER_ID):return
-    file_id=(photos[-1] or {}).get("file_id")
-    peer=person_name(original.get("from") or {}) or "Собеседник"
-    chat=message.get("chat") or {}
-    header=f"⏳ Фото из ответа\nЧат: {chat.get('first_name') or chat.get('title') or chat.get('id')}\nОт: {peer}\nID сообщения: {original.get('message_id')}"
-    if not await copy_photo_to_owner(file_id,header,int(BOT_OWNER_ID)):
-        await send_text(int(BOT_OWNER_ID),
-            header+"\n⚠️ Снимок не удалось получить через Bot API.")
-    
-async def mirror_business_message(m,edited=False):
-    """Best-effort copy of incoming Business updates. No media bytes or file_id in SQLite."""
-    if not BOT_OWNER_ID.isdigit() or not mirror_enabled():return
-    owner=int(BOT_OWNER_ID)
-    chat=m.get("chat") or {}
-    sender=m.get("from") or {}
-    title=chat.get("title") or " ".join(filter(None,[chat.get("first_name"),chat.get("last_name")])) or chat.get("username") or "Личный чат"
-    name=person_name(sender) or ("Отправлено от бизнес-аккаунта" if m.get("sender_business_bot") else "Неизвестный отправитель")
-    stamp=datetime.fromtimestamp(int(m.get("date") or datetime.now(timezone.utc).timestamp()),LOCAL_TZ).strftime("%d.%m.%Y %H:%M")
-    title=str(title)[:100]
-    heading=f"{'✏️ Изменено' if edited else '📩 Новое сообщение'}\nЧат: {title} (ID {chat.get('id')})\nОт: {name}\nВремя: {stamp} МСК\n"
-    if m.get("has_protected_content"):
-        await send_text(owner,heading+"\n[Защищённый контент: содержимое не копируется]")
-        return
-    body=str(m.get("text") or m.get("caption") or "")
-    photos=m.get("photo") or []
-    if photos and isinstance(photos,list):
-        file_id=(photos[-1] or {}).get("file_id")
-        if file_id:
-            caption=(heading+"\n"+body)[:980]
-            if is_expiring_photo(m):
-                delivered=await copy_photo_to_owner(file_id,"⏳ Исчезающее фото\n"+caption,owner)
-            else:
-                try:
-                    await telegram_api("sendPhoto",{
-                        "chat_id":owner,"photo":file_id,
-                        "caption":caption,
-                        "has_spoiler":bool(m.get("has_media_spoiler"))})
-                    delivered=True
-                except Exception as exc:
-                    log.info("Direct photo send unavailable: %s",type(exc).__name__)
-                    delivered=await copy_photo_to_owner(file_id,caption,owner)
-            if not delivered:
-                await send_text(owner,heading+"\n[Фото недоступно через Bot API]\n"+body[:2000])
-            elif len(body)>740:
-                await send_text(owner,"Подпись к фото (продолжение):\n"+body[740:3600])
-            return
-    if not body:
-        kinds=[k for k in ("video","document","voice","audio","video_note","sticker","animation") if m.get(k)]
-        body=("[Вложение: "+", ".join(kinds)+"]") if kinds else "[Нет доступного текста или фото]"
-    await send_text(owner,heading+"\n"+body[:3200])
-
-async def deliver_mirror_safely(m,edited=False):
-    try:
-        if (m.get("text") or "").strip().split(" ",1)[0].lower()!="/save_once":
-            await mirror_business_message(m,edited=edited)
-        await maybe_copy_replied_photo(m)
-    except Exception:
-        log.exception("Could not mirror Business message to owner")
+    originals,unseen=get_deleted_message_snapshot(event)
+    if (originals or unseen) and BOT_OWNER_ID.isdigit() and deleted_alerts_enabled():
+        await send_long_text(int(BOT_OWNER_ID),deleted_notice(event,originals,unseen))
+    mark_deleted(event)
 
 def mark_deleted(x):
     cid=x.get("business_connection_id"); chat_id=(x.get("chat") or {}).get("id"); ids=x.get("message_ids") or []
@@ -955,15 +876,17 @@ async def private_message(m):
         await send_text(chat_id,"Привет! Я Alexey AI. Отправь /id для настройки доступа." if not owner_ok(uid) else "Привет! Я на связи. Задай вопрос по архиву или отправь /help.");return
     if not owner_ok(uid):await send_text(chat_id,"Доступ закрыт. Владелец должен настроить BOT_OWNER_ID.");return
     if text.startswith("/help"):
-        await send_text(chat_id,"/status — состояние архива\n/mirror_on /mirror_off /mirror_status — пересылка в личку\n/save_once — ответом на исчезающее фото до открытия\n/chats — список чатов и их ID\n/analysis_status — ход последнего анализа\n/analysis_progress ID [номер] — сохранённые фрагменты\n/analysis_export ID — все промежуточные резюме\n/analyze_chat ID — запросить анализ чата (с подтверждением)\n/report_chat ID — показать сохранённый анализ чата\n/import — инструкция импорта JSON\n/search запрос — поиск по сообщениям\n/report [YYYY-MM-DD] — ежедневный отчёт\n/analyze [YYYY-MM-DD] — повторный анализ дня (с подтверждением)\n/confirm КОД — подтвердить платный анализ\n/cancel — отменить ожидающий анализ\n/notes — общие заметки из интеграции\n/stats — статистика архива\n/usage — расход токенов API\n/recent ID — последние сообщения чата\n/search_chat ID запрос — поиск в одном чате\n/help — помощь\nМожно задавать вопросы обычным текстом.");return
-    if text=="/mirror_on":
-        set_mirror_enabled(True)
-        await send_text(chat_id,"📩 Пересылка новых сообщений и обычных фото включена.");return
-    if text=="/mirror_off":
-        set_mirror_enabled(False)
-        await send_text(chat_id,"🔕 Пересылка новых сообщений и фото выключена. Архивирование текста не изменилось.");return
-    if text=="/mirror_status":
-        await send_text(chat_id,"Пересылка Business-сообщений: "+("включена" if mirror_enabled() else "выключена")+".\nФото и файлы в БД не сохраняются. Для исчезающего фото: ответь на него /save_once до открытия.");return
+        await send_text(chat_id,"/status — состояние архива\n/deleted_on /deleted_off /deleted_status — журнал удалений\n/chats — список чатов и их ID\n/analysis_status — ход последнего анализа\n/analysis_progress ID [номер] — сохранённые фрагменты\n/analysis_export ID — все промежуточные резюме\n/analyze_chat ID — запросить анализ чата (с подтверждением)\n/report_chat ID — показать сохранённый анализ чата\n/import — инструкция импорта JSON\n/search запрос — поиск по сообщениям\n/report [YYYY-MM-DD] — ежедневный отчёт\n/analyze [YYYY-MM-DD] — повторный анализ дня (с подтверждением)\n/confirm КОД — подтвердить платный анализ\n/cancel — отменить ожидающий анализ\n/notes — общие заметки из интеграции\n/stats — статистика архива\n/usage — расход токенов API\n/recent ID — последние сообщения чата\n/search_chat ID запрос — поиск в одном чате\n/help — помощь\nМожно задавать вопросы обычным текстом.");return
+    if text=="/deleted_on":
+        set_deleted_alerts_enabled(True)
+        await send_text(chat_id,"🗑 Уведомления об удалённых сообщениях включены.");return
+    if text=="/deleted_off":
+        set_deleted_alerts_enabled(False)
+        await send_text(chat_id,"🔕 Уведомления об удалениях отключены. Архивирование переписок не изменилось.");return
+    if text=="/deleted_status":
+        await send_text(chat_id,"🗑 Уведомления об удалённых сообщениях: "+
+                        ("включены" if deleted_alerts_enabled() else "отключены")+
+                        ".\nБот пишет только об удалениях, без пересылки обычных сообщений.");return
     if text.startswith("/notes"):
         with db() as c:
             notes=c.execute("SELECT subject,content,created_at FROM shared_notes ORDER BY id DESC LIMIT 10").fetchall()
@@ -1208,11 +1131,10 @@ async def webhook(request:Request,x_telegram_bot_api_secret_token:str|None=Heade
         if "business_connection" in update:save_connection(update["business_connection"])
         elif "business_message" in update:
             save_message(update["business_message"])
-            asyncio.create_task(deliver_mirror_safely(update["business_message"]))
         elif "edited_business_message" in update:
             save_message(update["edited_business_message"],True)
-            asyncio.create_task(deliver_mirror_safely(update["edited_business_message"],edited=True))
-        elif "deleted_business_messages" in update:mark_deleted(update["deleted_business_messages"])
+        elif "deleted_business_messages" in update:
+            await handle_deleted_business_messages(update["deleted_business_messages"])
         elif "message" in update:await private_message(update["message"])
     except Exception:
         log.exception("Failed Telegram update %s",update_id);raise HTTPException(500,"Update processing failed")
