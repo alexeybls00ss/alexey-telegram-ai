@@ -23,11 +23,12 @@ Commands:
 - `/chats` — list chats currently present in the archive with their Telegram chat IDs and message counts.
 - `/analyze_chat CHAT_ID` — analyze the full archived history of one private chat, including both participants.
 - `/report_chat CHAT_ID` — retrieve the most recently saved analysis for that chat.
+- `/import` — show instructions, then send a Telegram Desktop JSON export to the bot as a document to import it.
 
 The daily task runs inside the single Uvicorn process. Keep one replica / one worker for this deployment to avoid duplicate scheduled runs. If the service is down around the scheduled time, it catches up the previous day's missing report after the service comes back online.
 
 ## Limitations
-- Telegram does not provide a Bot API method to backfill old chat history. Only updates received after deployment and connection are archived.
+- Telegram does not provide a Bot API method to backfill old chat history. Telegram Desktop JSON exports can be imported by sending the `.json` document to the private bot chat; import is restricted to exports containing the configured `BOT_OWNER_ID` and personal chats.
 - Only chats selected and permitted in the Telegram Business connection can be processed; this does not grant access to every Telegram chat, group or channel automatically.
 - Attachment contents are not downloaded or transcribed yet; only markers for photos, audio, documents and other attachment types are stored.
 - Search remains keyword-based with relevance ranking, not full semantic/vector search. Daily summaries improve context retrieval but do not replace original messages.
