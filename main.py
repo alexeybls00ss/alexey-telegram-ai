@@ -71,6 +71,9 @@ def init_db():
             session_hash TEXT PRIMARY KEY,csrf_token TEXT NOT NULL,
             created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL)""")
         c.execute("CREATE INDEX IF NOT EXISTS idx_bridge_sessions_expiry ON bridge_sessions(expires_at)")
+        c.execute("""CREATE TABLE IF NOT EXISTS bridge_read_keys(
+            key_id INTEGER PRIMARY KEY CHECK(key_id=1),
+            token_hash TEXT NOT NULL,created_at INTEGER NOT NULL)""")
         c.execute("""CREATE TABLE IF NOT EXISTS diagnostic_events(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at INTEGER NOT NULL,
@@ -1743,7 +1746,7 @@ async def private_message(m):
         await send_text(chat_id,"Привет! Я Alexey AI. Отправь /id для настройки доступа." if not owner_ok(uid) else "Привет! Я на связи. Задай вопрос по архиву или отправь /help.");return
     if not owner_ok(uid):await send_text(chat_id,"Доступ закрыт. Владелец должен настроить BOT_OWNER_ID.");return
     if text.startswith("/help"):
-        await send_text(chat_id,"/status — состояние архива\n/diagnostics — здоровье бота, архива, фото и Telegram\n/diagnostics_chat ID — проверка конкретного чата\n/deleted_on /deleted_off /deleted_status — журнал удалений\n/edits_on /edits_off /edits_status — уведомления об изменениях\n/edits ID [страница] — изменения в чате\n/edit_history ID MESSAGE_ID — все версии сообщения\n/photo_stats — сколько фотографий сохранено\n/expiring_status /expiring_list /expiring_send — архив исчезающих фото\n/chats — список чатов и их ID\n/analysis_status — ход последнего анализа\n/analysis_progress ID [номер] — сохранённые фрагменты\n/analysis_export ID — все промежуточные резюме\n/analyze_chat ID — запросить анализ чата (с подтверждением)\n/report_chat ID — показать сохранённый анализ чата\n/import — инструкция импорта JSON\n/search запрос — поиск по сообщениям\n/report [YYYY-MM-DD] — ежедневный отчёт\n/analyze [YYYY-MM-DD] — повторный анализ дня (с подтверждением)\n/confirm КОД — подтвердить платный анализ\n/cancel — отменить ожидающий анализ\n/notes — общие заметки из интеграции\n/sync_status — состояние обмена ChatGPT ↔ Telegram\n/sync_link — безопасный вход ChatGPT в живой архив\n/sync_note Тема | Текст — добавить общую заметку\n/sync_notes — показать общие заметки\n/sync_export CHAT_ID [1-200] — экспорт чата в ChatGPT\n/stats — статистика архива\n/model — назначение моделей и тарифы\n/usage — токены и оценка затрат API\n/deep ВОПРОС — запрос GPT-5.4 с подтверждением\n/recent ID — последние сообщения чата\n/search_chat ID запрос — поиск в одном чате\n/help — помощь\nМожно задавать вопросы обычным текстом.");return
+        await send_text(chat_id,"/status — состояние архива\n/diagnostics — здоровье бота, архива, фото и Telegram\n/diagnostics_chat ID — проверка конкретного чата\n/deleted_on /deleted_off /deleted_status — журнал удалений\n/edits_on /edits_off /edits_status — уведомления об изменениях\n/edits ID [страница] — изменения в чате\n/edit_history ID MESSAGE_ID — все версии сообщения\n/photo_stats — сколько фотографий сохранено\n/expiring_status /expiring_list /expiring_send — архив исчезающих фото\n/chats — список чатов и их ID\n/analysis_status — ход последнего анализа\n/analysis_progress ID [номер] — сохранённые фрагменты\n/analysis_export ID — все промежуточные резюме\n/analyze_chat ID — запросить анализ чата (с подтверждением)\n/report_chat ID — показать сохранённый анализ чата\n/import — инструкция импорта JSON\n/search запрос — поиск по сообщениям\n/report [YYYY-MM-DD] — ежедневный отчёт\n/analyze [YYYY-MM-DD] — повторный анализ дня (с подтверждением)\n/confirm КОД — подтвердить платный анализ\n/cancel — отменить ожидающий анализ\n/notes — общие заметки из интеграции\n/sync_status — состояние обмена ChatGPT ↔ Telegram\n/sync_link — секретная прямая ссылка на архив без ввода кода\n/sync_revoke — отозвать ссылку\n/sync_note Тема | Текст — добавить общую заметку\n/sync_notes — показать общие заметки\n/sync_export CHAT_ID [1-200] — экспорт чата в ChatGPT\n/stats — статистика архива\n/model — назначение моделей и тарифы\n/usage — токены и оценка затрат API\n/deep ВОПРОС — запрос GPT-5.4 с подтверждением\n/recent ID — последние сообщения чата\n/search_chat ID запрос — поиск в одном чате\n/help — помощь\nМожно задавать вопросы обычным текстом.");return
     if text=="/edits_on":
         set_edit_alerts_enabled(True)
         await send_text(chat_id,"✏️ Уведомления об изменениях включены. Каждая версия сохраняется.");return
@@ -1795,14 +1798,21 @@ async def private_message(m):
     if text=="/sync_status":
         await send_text(chat_id,sync_status_text());return
     if text=="/sync_link":
-        from sync_portal import create_login_code
-        code=create_login_code(db)
-        url=(WEBHOOK_URL or "https://alexey-telegram-ai-production.up.railway.app")+"/bridge"
-        await send_text(chat_id,"🔐 Подключение ChatGPT к архиву\n"
-                        f"Открой: {url}\n"
-                        f"Одноразовый код (действует 10 минут):\n{code}\n\n"
-                        "Введи его только на странице по ссылке. Не присылай код в ChatGPT. "
-                        "После входа браузер сможет читать архив и сохранять общие заметки.")
+        from sync_portal import create_read_link
+        url=create_read_link(db,WEBHOOK_URL or "https://alexey-telegram-ai-production.up.railway.app")
+        await send_text(chat_id,"🔗 Прямой доступ к Telegram-архиву (только чтение)\n\n"
+                        f"{url}\n\n"
+                        "Больше не требуется вводить одноразовый код или сохранять cookie. "
+                        "Открой ссылку или передай её в личный чат с ChatGPT для чтения архива.\n"
+                        "⚠️ Ссылка секретная: любой, кто её получит, сможет читать все доступные переписки. "
+                        "Не публикуй её. Повторная /sync_link заменит предыдущую. "
+                        "Для немедленного отключения: /sync_revoke.")
+        return
+    if text=="/sync_revoke":
+        from sync_portal import revoke_read_link
+        revoke_read_link(db)
+        await send_text(chat_id,"🔒 Прямая ссылка отключена. "
+                        "Старые ссылки больше не откроют архив. Новую получишь через /sync_link.")
         return
     if text=="/sync_notes":
         await send_long_text(chat_id,sync_notes_text());return
