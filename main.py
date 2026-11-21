@@ -20,7 +20,7 @@ DATABASE_PATH=Path(os.getenv("DATABASE_PATH","./data/archive.sqlite3"))
 LOCAL_TZ=ZoneInfo(os.getenv("APP_TIMEZONE","Europe/Istanbul"))
 REPORT_LOCK=asyncio.Lock()
 DAILY_TASK=None
-app=FastAPI(title="Alexey Telegram AI",version="0.2.0")
+app=FastAPI(title="Alexey Telegram AI",version="0.3.0")
 
 def db_connect():
     DATABASE_PATH.parent.mkdir(parents=True,exist_ok=True)
@@ -627,7 +627,7 @@ async def private_message(m):
     except Exception as e:
         log.exception("OpenAI request failed");await send_text(chat_id,f"Ошибка запроса к ИИ: {type(e).__name__}. Проверь API-ключ, модель и лимиты.")
 @app.get("/health")
-async def health():return {"status":"ok","service":"alexey-telegram-ai"}
+async def health():return {"status":"ok","service":"alexey-telegram-ai","version":"0.3.0"}
 @app.on_event("startup")
 async def startup():
     global DAILY_TASK
