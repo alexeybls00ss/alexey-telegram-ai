@@ -278,6 +278,124 @@ def format_archived_chats(limit=40):
         last=datetime.fromtimestamp(row["last_at"],LOCAL_TZ).strftime("%d.%m.%Y")
         result.append(f"• {row['chat_title'] or 'Без названия'} — ID {row['chat_id']} — {row['n']} сообщ. — {first}–{last}")
     return "\n".join(result)
+def export_user_id(value):
+    if isinstance(value,int):return value
+    match=re.search(r"(\d+)$",str(value or ""))
+    return int(match.group(1)) if match else None
+def flatten_export_text(value):
+    if isinstance(value,str):return value
+    if isinstance(value,list):
+        parts=[]
+        for item in value:
+            if isinstance(item,str):parts.append(item)
+            elif isinstance(item,dict):parts.append(str(item.get("text") or ""))
+        return "".join(parts)
+    return ""
+def export_timestamp(message):
+    raw=message.get("date_unixtime")
+    if raw is not None:
+        try:return int(float(raw))
+        except (TypeError,ValueError):pass
+    raw=message.get("date")
+    if not raw:raise ValueError("В сообщении не указана дата")
+    parsed=datetime.fromisoformat(str(raw).replace("Z","+00:00"))
+    if parsed.tzinfo is None:parsed=parsed.replace(tzinfo=LOCAL_TZ)
+    return int(parsed.timestamp())
+def export_message_body(message):
+    body=flatten_export_text(message.get("text")).strip()
+    media=[]
+    media_type=message.get("media_type")
+    if media_type:media.append(str(media_type))
+    elif message.get("photo"):media.append("photo")
+    elif message.get("file"):media.append("file")
+    elif message.get("sticker_emoji"):media.append("sticker")
+    elif message.get("audio_file"):media.append("audio")
+    emoji=message.get("sticker_emoji")
+    if emoji:media.append(str(emoji))
+    filename=message.get("file_name")
+    if filename:media.append(str(filename))
+    if media:body=(body+"\n" if body else "")+"[вложение: "+", ".join(dict.fromkeys(media))+"]"
+    reply=message.get("reply_to_message_id")
+    if reply:body=(body+"\n" if body else "")+f"[ответ на сообщение #{reply}]"
+    reactions=[]
+    for reaction in message.get("reactions") or []:
+        emoji=reaction.get("emoji") or reaction.get("custom_emoji_id") or "реакция"
+        count=reaction.get("count",1)
+        reactions.append(f"{emoji} ×{count}")
+    if reactions:body=(body+"\n" if body else "")+"[реакции: "+", ".join(reactions)+"]"
+    return body or "[сообщение без текстового содержимого]"
+def import_telegram_desktop_export(payload):
+    if not isinstance(payload,dict) or payload.get("type")!="personal_chat":
+        raise ValueError("Поддерживается экспорт одного личного чата Telegram Desktop (personal_chat).")
+    chat_id=payload.get("id")
+    if not isinstance(chat_id,int):raise ValueError("В экспорте отсутствует корректный ID чата.")
+    owner_id=int(BOT_OWNER_ID) if BOT_OWNER_ID.isdigit() else None
+    if owner_id is None:raise ValueError("Сначала настрой BOT_OWNER_ID в Railway.")
+    messages=payload.get("messages")
+    if not isinstance(messages,list):raise ValueError("В экспорте не найден список messages.")
+    export_senders={export_user_id(m.get("from_id")) for m in messages if isinstance(m,dict)}
+    if owner_id not in export_senders:
+        raise ValueError("В этом экспорте не найден твой BOT_OWNER_ID. Проверь, что это твоя переписка и что ID владельца в Railway настроен верно.")
+    with db() as conn:
+        active=conn.execute("""SELECT connection_id FROM business_connections
+        WHERE user_id=? AND is_enabled=1 ORDER BY updated_at DESC LIMIT 1""",(owner_id,)).fetchone()
+        if active:
+            connection_id=active["connection_id"];source="existing Business connection"
+        else:
+            connection_id=f"telegram-export:{chat_id}";source="Telegram Desktop import"
+            conn.execute("""INSERT OR IGNORE INTO business_connections
+            (connection_id,user_id,is_enabled,rights_json,updated_at) VALUES(?,?,0,?,?)""",
+            (connection_id,owner_id,json.dumps({"source":"telegram_desktop_export"},ensure_ascii=False),
+             int(datetime.now(timezone.utc).timestamp())))
+        existing={row["message_id"] for row in conn.execute(
+            "SELECT message_id FROM messages WHERE connection_id=? AND chat_id=?",(connection_id,chat_id)).fetchall()}
+        inserted=updated=skipped=0
+        chat_title=str(payload.get("name") or f"Чат {chat_id}")
+        low_date=high_date=None
+        for item in messages:
+            if not isinstance(item,dict) or item.get("type")!="message":
+                skipped+=1;continue
+            message_id=item.get("id")
+            if not isinstance(message_id,int):
+                skipped+=1;continue
+            sender_id=export_user_id(item.get("from_id"))
+            if sender_id is None:
+                skipped+=1;continue
+            try:timestamp=export_timestamp(item)
+            except (TypeError,ValueError,OverflowError):
+                skipped+=1;continue
+            body=export_message_body(item)
+            sender_name="Алексей" if sender_id==owner_id else str(item.get("from") or "Собеседник")
+            was_present=message_id in existing
+            conn.execute("""INSERT INTO messages(connection_id,chat_id,message_id,chat_title,chat_username,
+            sender_id,sender_name,sender_username,message_date,text,edited,deleted,sender_is_business_bot)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,0,0)
+            ON CONFLICT(connection_id,chat_id,message_id) DO UPDATE SET
+            chat_title=excluded.chat_title,sender_id=excluded.sender_id,sender_name=excluded.sender_name,
+            message_date=excluded.message_date,text=excluded.text,
+            edited=MAX(messages.edited,excluded.edited),deleted=0""",
+            (connection_id,chat_id,message_id,chat_title,None,sender_id,sender_name,None,timestamp,body,
+             int(bool(item.get("edited_unixtime") or item.get("edited")))))
+            if was_present:updated+=1
+            else:inserted+=1
+            low_date=timestamp if low_date is None else min(low_date,timestamp)
+            high_date=timestamp if high_date is None else max(high_date,timestamp)
+    fmt=lambda value:datetime.fromtimestamp(value,LOCAL_TZ).strftime("%d.%m.%Y") if value else None
+    return {"chat_id":chat_id,"chat_title":chat_title,"inserted":inserted,"updated":updated,
+            "skipped":skipped,"total":inserted+updated,"first_date":fmt(low_date),"last_date":fmt(high_date),
+            "connection_source":source}
+async def download_telegram_document(file_id):
+    result=await telegram_api("getFile",{"file_id":file_id})
+    file_path=result.get("file_path")
+    if not file_path:raise RuntimeError("Telegram не вернул путь к файлу.")
+    url=f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+    async with httpx.AsyncClient(timeout=60) as client:
+        response=await client.get(url)
+        response.raise_for_status()
+        if len(response.content)>10*1024*1024:raise ValueError("Файл больше 10 МБ.")
+        try:return json.loads(response.content.decode("utf-8-sig"))
+        except (UnicodeDecodeError,json.JSONDecodeError) as e:
+            raise ValueError("Не удалось прочитать JSON. Нужен экспорт Telegram Desktop в формате JSON.") from e
 async def call_ai(instructions,input_text,timeout=180,max_output_tokens=2200):
     if not OPENAI_API_KEY:raise RuntimeError("OPENAI_API_KEY не настроен")
     async with httpx.AsyncClient(timeout=timeout) as client:
@@ -431,7 +549,31 @@ async def private_message(m):
         await send_text(chat_id,"Привет! Я Alexey AI. Отправь /id для настройки доступа." if not owner_ok(uid) else "Привет! Я на связи. Задай вопрос по архиву или отправь /help.");return
     if not owner_ok(uid):await send_text(chat_id,"Доступ закрыт. Владелец должен настроить BOT_OWNER_ID.");return
     if text.startswith("/help"):
-        await send_text(chat_id,"/status — состояние архива\n/chats — список чатов и их ID\n/analyze_chat ID — анализ всей истории одного чата\n/report_chat ID — показать сохранённый анализ чата\n/search запрос — поиск по сообщениям\n/report [YYYY-MM-DD] — ежедневный отчёт\n/analyze [YYYY-MM-DD] — повторный анализ дня\n/help — помощь\nМожно задавать вопросы обычным текстом.");return
+        await send_text(chat_id,"/status — состояние архива\n/chats — список чатов и их ID\n/analyze_chat ID — анализ всей истории одного чата\n/report_chat ID — показать сохранённый анализ чата\n/import — инструкция импорта JSON\n/search запрос — поиск по сообщениям\n/report [YYYY-MM-DD] — ежедневный отчёт\n/analyze [YYYY-MM-DD] — повторный анализ дня\n/help — помощь\nМожно задавать вопросы обычным текстом.");return
+    if text.startswith("/import"):
+        await send_text(chat_id,"Чтобы загрузить старую переписку: отправь мне файл result.json как документ (не как фото). Поддерживается экспорт одного личного чата из Telegram Desktop → JSON. Импорт проверяет, что экспорт содержит твой BOT_OWNER_ID.");return
+    document=m.get("document")
+    if document:
+        filename=str(document.get("file_name") or "").lower()
+        if not filename.endswith(".json"):
+            await send_text(chat_id,"Пожалуйста, отправь JSON-файл экспорта Telegram Desktop как документ.");return
+        size=document.get("file_size")
+        if size is not None and int(size)>10*1024*1024:
+            await send_text(chat_id,"Файл больше 10 МБ. Раздели экспорт или отправь JSON меньшего размера.");return
+        await send_text(chat_id,"Получил JSON. Проверяю экспорт и загружаю сообщения в архив…")
+        try:
+            payload=await download_telegram_document(document.get("file_id"))
+            result=import_telegram_desktop_export(payload)
+            await send_text(chat_id,
+                f"Импорт завершён: {result['chat_title']}\nID чата: {result['chat_id']}\n"
+                f"Новых сообщений: {result['inserted']}\nОбновлено ранее загруженных: {result['updated']}\n"
+                f"Пропущено служебных/неполных записей: {result['skipped']}\n"
+                f"Период: {result['first_date']} — {result['last_date']}\n\n"
+                f"Теперь можно выполнить: /analyze_chat {result['chat_id']}")
+        except Exception as e:
+            log.exception("Telegram export import failed")
+            await send_text(chat_id,f"Не удалось импортировать файл: {type(e).__name__}: {str(e)[:500]}")
+        return
     if text.startswith("/chats"):
         await send_long_text(chat_id,format_archived_chats());return
     if text.startswith("/analyze_chat"):
