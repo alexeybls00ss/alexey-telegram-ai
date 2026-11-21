@@ -86,6 +86,58 @@ class ArchiveSmokeTest(unittest.TestCase):
         self.assertIsNone(main.get_contact_report(7001))
         self.assertIn("7001", main.format_archived_chats())
 
+    def test_import_telegram_desktop_export(self):
+        main.init_db()
+        payload = {
+            "name": "Чат Мирослав",
+            "type": "personal_chat",
+            "id": 7076188523,
+            "messages": [
+                {
+                    "id": 101, "type": "message", "date": "2026-07-24T20:53:21",
+                    "date_unixtime": "1784915601", "from": "No Name",
+                    "from_id": "user100", "text": "Привет от Алексея"
+                },
+                {
+                    "id": 102, "type": "message", "date": "2026-07-24T20:53:22",
+                    "date_unixtime": "1784915602", "from": "Мирослав",
+                    "from_id": "user7076188523", "text": [
+                        "Привет, ",
+                        {"type": "custom_emoji", "text": "🐗", "document_id": "emoji"},
+                    ], "reply_to_message_id": 101
+                },
+                {
+                    "id": 103, "type": "service", "date": "2026-07-24T20:53:23",
+                    "date_unixtime": "1784915603"
+                }
+            ]
+        }
+        result = main.import_telegram_desktop_export(payload)
+        self.assertEqual(result["chat_id"], 7076188523)
+        self.assertEqual(result["inserted"], 2)
+        self.assertEqual(result["skipped"], 1)
+        rows = main.get_contact_messages(7076188523)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(main.message_author(rows[0]), "Алексей")
+        self.assertEqual(main.message_author(rows[1]), "Мирослав")
+        self.assertIn("[ответ на сообщение #101]", rows[1]["text"])
+        self.assertIn("🐗", rows[1]["text"])
+        again = main.import_telegram_desktop_export(payload)
+        self.assertEqual(again["inserted"], 0)
+        self.assertEqual(again["updated"], 2)
+
+    def test_import_requires_owner_id_in_export(self):
+        main.init_db()
+        payload = {
+            "name": "Не мой чат", "type": "personal_chat", "id": 7076188524,
+            "messages": [{
+                "id": 1, "type": "message", "date_unixtime": "1784915601",
+                "from": "Someone", "from_id": "user999", "text": "test"
+            }]
+        }
+        with self.assertRaises(ValueError):
+            main.import_telegram_desktop_export(payload)
+
 
 if __name__ == "__main__":
     unittest.main()
