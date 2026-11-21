@@ -10,12 +10,18 @@ from unittest.mock import AsyncMock,patch
 from urllib.parse import urlsplit,parse_qs
 
 import httpx
-import main
 from sync_portal import _hash
+
+# Defer app import until after test_smoke configures test owner/database.
+main=None
 
 
 class DirectReadLinkTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        global main
+        if main is None:
+            import main as loaded_main
+            main=loaded_main
         tmp=tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         db_patch=patch.object(main,"DATABASE_PATH",Path(tmp.name)/"archive.sqlite3")
