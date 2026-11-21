@@ -1,6 +1,7 @@
 from __future__ import annotations
 import asyncio
 import difflib
+import shutil
 import secrets, contextvars, hashlib, hmac, html, json, logging, os, re, sqlite3
 from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta, timezone
@@ -62,6 +63,21 @@ def init_db():
     with db() as c:
         c.execute("PRAGMA journal_mode=WAL")
         c.execute("CREATE TABLE IF NOT EXISTS seen_updates(update_id INTEGER PRIMARY KEY,received_at INTEGER NOT NULL)")
+        c.execute("""CREATE TABLE IF NOT EXISTS diagnostic_events(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at INTEGER NOT NULL,
+            component TEXT NOT NULL,
+            severity TEXT NOT NULL CHECK(severity IN ('warning','error')),
+            code TEXT NOT NULL,
+            chat_id INTEGER)""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_diagnostic_events_time ON diagnostic_events(created_at DESC)")
+        c.execute("""CREATE TABLE IF NOT EXISTS diagnostic_chat_activity(
+            connection_id TEXT NOT NULL,
+            chat_id INTEGER NOT NULL,
+            kind TEXT NOT NULL CHECK(kind IN ('new','edit','delete')),
+            received_at INTEGER NOT NULL,
+            PRIMARY KEY(connection_id,chat_id,kind))""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_diagnostic_activity_time ON diagnostic_chat_activity(received_at DESC)")
         c.execute("""CREATE TABLE IF NOT EXISTS business_connections(
         connection_id TEXT PRIMARY KEY,user_id INTEGER,is_enabled INTEGER NOT NULL DEFAULT 0,
         rights_json TEXT,updated_at INTEGER NOT NULL)""")
@@ -329,6 +345,7 @@ async def archive_business_photo(message,source="business"):
     size=item.get("file_size")
     if isinstance(size,int) and size>PHOTO_LIMIT_BYTES:
         log.warning("Photo too large to archive for message %s",message_id)
+        diagnostic_event("photos","file_too_large",chat_id)
         return False
     with db() as c:
         old=c.execute("""SELECT file_path,photo_unique_id FROM archived_photos
@@ -366,6 +383,7 @@ async def archive_business_photo(message,source="business"):
     except Exception as exc:
         # Do not leak the bot token, file ID, or signed file URL into logs.
         log.warning("Photo archiving failed for message %s: %s",message_id,type(exc).__name__)
+        diagnostic_event("photos","download_failed",chat_id)
         return False
 
 async def archive_replied_business_photo(message):
@@ -447,6 +465,7 @@ async def run_mtproto_archive():
         raise
     except Exception as exc:
         log.error("MTProto watcher stopped: %s",type(exc).__name__)
+        diagnostic_event("mtproto","watcher_stopped",severity="error")
 
 def mtproto_photo_for_message(chat_id,message_id):
     with db() as c:
@@ -559,6 +578,7 @@ async def notify_edit(edit_id):
             "parse_mode":"HTML"})
     except Exception:
         log.warning("Rich edit notification failed, trying plain text",exc_info=True)
+        diagnostic_event("edits","rich_notification_failed",row["chat_id"])
         prior=row["before_text"] if row["before_text"] is not None else "[Предыдущая версия неизвестна]"
         await send_long_text(int(BOT_OWNER_ID),
             f"✏️ Изменено сообщение #{row['message_id']} в чате {row['chat_title'] or row['chat_id']}\n"
@@ -688,6 +708,7 @@ async def handle_deleted_business_messages(event):
                             (int(datetime.now(timezone.utc).timestamp()),row["chat_id"],row["message_id"]))
             except Exception as exc:
                 log.warning("Unable to send deleted photo %s: %s",row["message_id"],type(exc).__name__)
+                diagnostic_event("photos","deleted_photo_delivery_failed",row["chat_id"])
                 await send_text(owner,f"⚠️ Не удалось переслать фото из сообщения #{row['message_id']}.")
         for message_id in unseen:
             photo_record,path=mtproto_photo_for_message((event.get("chat") or {}).get("id"),message_id)
@@ -704,6 +725,7 @@ async def handle_deleted_business_messages(event):
                         (int(datetime.now(timezone.utc).timestamp()),photo_record["chat_id"],message_id))
             except Exception as exc:
                 log.warning("Unable to send MTProto photo %s: %s",message_id,type(exc).__name__)
+                diagnostic_event("photos","mtproto_photo_delivery_failed",photo_record["chat_id"])
     mark_deleted(event)
 
 def mark_deleted(x):
@@ -1307,6 +1329,228 @@ def archive_search_chat(chat_id,query,limit=20):
         rows=c.execute(f"SELECT m.*,b.user_id AS owner_user_id FROM messages m LEFT JOIN business_connections b ON b.connection_id=m.connection_id WHERE m.deleted=0 AND m.chat_id=? AND {clause} ORDER BY m.message_date DESC LIMIT ?",(chat_id,*[f"%{t}%" for t in terms],limit)).fetchall()
     return "Найдено:\n\n"+"\n\n".join(contact_message_line(r)[:850] for r in rows) if rows else "Совпадений в этом чате нет."
 
+def diagnostic_event(component,code,chat_id=None,severity="warning"):
+    """Store safe failure codes, not exception strings, message text, or credentials."""
+    if component not in ("photos","telegram","edits","deletions","mtproto","webhook"):
+        return
+    if severity not in ("warning","error"):return
+    if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}",code):return
+    try:
+        now=int(datetime.now(timezone.utc).timestamp())
+        with db() as c:
+            c.execute("""INSERT INTO diagnostic_events(created_at,component,severity,code,chat_id)
+                VALUES(?,?,?,?,?)""",
+                (now,component,severity,code,int(chat_id) if type(chat_id) is int else None))
+            c.execute("DELETE FROM diagnostic_events WHERE created_at<?",(now-30*86400,))
+            c.execute("""DELETE FROM diagnostic_events WHERE id NOT IN
+                (SELECT id FROM diagnostic_events ORDER BY id DESC LIMIT 1500)""")
+    except (sqlite3.Error,OSError):
+        log.warning("Failed writing diagnostic event metadata")
+
+def diagnostic_activity(connection_id,chat_id,kind):
+    """Record an actual incoming Business update separately from imported history."""
+    if not connection_id or type(chat_id) is not int or kind not in ("new","edit","delete"):return
+    try:
+        with db() as c:
+            c.execute("""INSERT INTO diagnostic_chat_activity(
+                connection_id,chat_id,kind,received_at) VALUES(?,?,?,?)
+                ON CONFLICT(connection_id,chat_id,kind) DO UPDATE SET
+                received_at=excluded.received_at""",
+                (connection_id,chat_id,kind,int(datetime.now(timezone.utc).timestamp())))
+    except (sqlite3.Error,OSError):
+        log.warning("Failed writing diagnostic activity metadata")
+
+def diagnostic_time(stamp):
+    if stamp is None:return "нет данных"
+    return datetime.fromtimestamp(int(stamp),LOCAL_TZ).strftime("%d.%m.%Y %H:%M")
+
+def diagnostics_snapshot():
+    """Fast local checks; don't confuse an archived message date with recent activity."""
+    now=int(datetime.now(timezone.utc).timestamp())
+    with db() as c:
+        c.execute("SELECT 1")
+        business=c.execute("""SELECT COUNT(*) AS total,
+            COALESCE(SUM(is_enabled),0) AS active,MAX(updated_at) AS updated
+            FROM business_connections""").fetchone()
+        messages=c.execute("""SELECT COUNT(*) AS total,
+            COUNT(DISTINCT chat_id) AS chats,
+            COALESCE(SUM(deleted),0) AS deleted,
+            MAX(message_date) AS last_at FROM messages""").fetchone()
+        photos=c.execute("""SELECT COUNT(*) AS total,
+            COALESCE(SUM(file_size),0) AS bytes,
+            MAX(saved_at) AS last_at,
+            COALESCE(SUM(is_ephemeral),0) AS ephemeral
+            FROM archived_photos""").fetchone()
+        media_samples=c.execute("""SELECT file_path FROM archived_photos
+            ORDER BY saved_at DESC LIMIT 12""").fetchall()
+        mtphotos=c.execute("""SELECT COUNT(*) AS total,MAX(saved_at) AS last_at
+            FROM mtproto_photos""").fetchone()
+        edits=c.execute("""SELECT COUNT(*) AS total,MAX(observed_at) AS last_at,
+            COALESCE(SUM(CASE WHEN notified_at IS NULL THEN 1 ELSE 0 END),0) AS unnotified
+            FROM message_edits""").fetchone()
+        updates=c.execute("""SELECT COUNT(*) AS total,MAX(received_at) AS last_at
+            FROM seen_updates""").fetchone()
+        activity=c.execute("""SELECT kind,MAX(received_at) AS last_at
+            FROM diagnostic_chat_activity GROUP BY kind""").fetchall()
+        active_chats=c.execute("""SELECT chat_id,MAX(received_at) AS last_at
+            FROM diagnostic_chat_activity GROUP BY chat_id ORDER BY last_at DESC LIMIT 5""").fetchall()
+        errors=c.execute("""SELECT created_at,component,severity,code,chat_id
+            FROM diagnostic_events WHERE created_at>=?
+            ORDER BY id DESC LIMIT 5""",(now-86400,)).fetchall()
+        error_count=c.execute("""SELECT COUNT(*) AS n FROM diagnostic_events
+            WHERE created_at>=?""",(now-86400,)).fetchone()["n"]
+        usage=c.execute("""SELECT COUNT(*) AS calls,
+            COALESCE(SUM(input_tokens),0) AS input,
+            COALESCE(SUM(output_tokens),0) AS output
+            FROM api_usage WHERE created_at>=?""",(now-86400,)).fetchone()
+        settings={r["key"]:r["value"] for r in c.execute(
+            "SELECT key,value FROM bot_settings WHERE key IN ('edit_alerts','deleted_alerts')").fetchall()}
+        last_report=c.execute("SELECT MAX(report_date) AS day FROM daily_reports").fetchone()["day"]
+        last_job=c.execute("""SELECT status,stage,updated_at FROM analysis_jobs
+            ORDER BY updated_at DESC LIMIT 1""").fetchone()
+    missing_sample=0
+    for rec in media_samples:
+        p=Path(rec["file_path"])
+        try:
+            if not p.resolve().is_relative_to(PHOTO_ARCHIVE_DIR.resolve()) or not p.is_file():
+                missing_sample+=1
+        except (OSError,ValueError):
+            missing_sample+=1
+    try:
+        usage_disk=shutil.disk_usage(DATABASE_PATH.parent)
+        disk={"total":usage_disk.total,"free":usage_disk.free}
+    except OSError:
+        disk=None
+    try:db_size=DATABASE_PATH.stat().st_size
+    except OSError:db_size=None
+    return {
+        "now":now,
+        "business":dict(business),"messages":dict(messages),
+        "photos":dict(photos),"photo_sample_count":len(media_samples),
+        "photo_sample_missing":missing_sample,
+        "mtphotos":dict(mtphotos),"edits":dict(edits),"updates":dict(updates),
+        "activity":{r["kind"]:r["last_at"] for r in activity},
+        "active_chats":[dict(r) for r in active_chats],
+        "errors":[dict(r) for r in errors],"error_count":error_count,
+        "usage":dict(usage),"settings":settings,
+        "disk":disk,"database_bytes":db_size,
+        "last_report":last_report,
+        "last_job":dict(last_job) if last_job else None,
+    }
+
+def diagnostics_text(data,webhook=None,webhook_error=False):
+    """Never include secrets, chat contents or arbitrary API error messages."""
+    business=data["business"];messages=data["messages"];photos=data["photos"];edits=data["edits"]
+    settings=data["settings"]
+    def enabled(key):return "включены" if settings.get(key)!="0" else "выключены"
+    lines=["🔎 ДИАГНОСТИКА ALEXEY AI",
+           f"Снимок: {diagnostic_time(data['now'])} ({LOCAL_TZ.key})",
+           "",
+           "🔌 Telegram Business",
+           f"Подключений: {business['active']} активных из {business['total']}",
+           f"Последнее изменение подключения: {diagnostic_time(business['updated'])}",
+           f"Последнее новое сообщение (получено ботом): {diagnostic_time(data['activity'].get('new'))}",
+           f"Последнее редактирование (получено): {diagnostic_time(data['activity'].get('edit'))}",
+           f"Последнее удаление (получено): {diagnostic_time(data['activity'].get('delete'))}"]
+    if webhook_error:
+        lines.append("⚠️ Telegram webhook: не удалось проверить сейчас")
+    elif isinstance(webhook,dict):
+        expected=f"{WEBHOOK_URL}/telegram/webhook" if WEBHOOK_URL else ""
+        configured=webhook.get("url") or ""
+        lines.append("Webhook: "+("✅ адрес совпадает" if configured and configured==expected else "⚠️ адрес отсутствует или не совпадает"))
+        lines.append(f"Telegram pending updates: {int(webhook.get('pending_update_count') or 0)}")
+        if webhook.get("last_error_date"):
+            lines.append(f"Последняя ошибка доставки Telegram: {diagnostic_time(webhook['last_error_date'])} "
+                         "(содержимое ошибки скрыто)")
+    else:lines.append("Webhook: не проверялся")
+    lines.extend(["","🗃 Архив и медиа",
+                  f"Сообщений: {messages['total']} (отмечено удалёнными: {messages['deleted']})",
+                  f"Чатов в архиве: {messages['chats']}",
+                  f"Дата самого нового сообщения в архиве: {diagnostic_time(messages['last_at'])}",
+                  f"Обычных фото: {photos['total']} ({photos['bytes']/1048576:.2f} МиБ),"
+                  f" последнее сохранение {diagnostic_time(photos['last_at'])}",
+                  f"Фото с TTL-признаком через Bot API: {photos['ephemeral']}",
+                  f"Фото через MTProto: {data['mtphotos']['total']}",
+                  f"Проверка файлов: {data['photo_sample_count']-data['photo_sample_missing']}/"
+                  f"{data['photo_sample_count']} последних доступны"])
+    if data["photo_sample_missing"]:
+        lines.append("⚠️ У части последних фото файл отсутствует на диске")
+    disk=data["disk"]
+    if disk:
+        lines.append(f"Файловая система: свободно {disk['free']/1048576:.0f} МиБ "
+                     "(не обязательно квота Railway)")
+        if disk["free"]<100*1048576:
+            lines.append("⚠️ Мало свободного места")
+    else:lines.append("⚠️ Свободное место: не удалось измерить")
+    lines.extend(["","🛠 Функции",
+                  f"Удаления: {enabled('deleted_alerts')}",
+                  f"Редактирования: {enabled('edit_alerts')} (записано {edits['total']})",
+                  f"MTProto: {mtproto_status_text()}",
+                  f"Последний ежедневный отчёт: {data['last_report'] or 'нет'}",
+                  "Последний анализ: "+(
+                      f"{data['last_job']['status']} ({diagnostic_time(data['last_job']['updated_at'])})"
+                      if data["last_job"] else "нет"),
+                  f"OpenAI за 24 ч: {data['usage']['calls']} запросов,"
+                  f" {data['usage']['input']} входных и {data['usage']['output']} выходных токенов",
+                  "",
+                  f"⚠️ Ошибки за 24 ч (зафиксированные): {data['error_count']}"])
+    for err in data["errors"]:
+        extra=f" • чат {err['chat_id']}" if err["chat_id"] is not None else ""
+        lines.append(f"• {diagnostic_time(err['created_at'])} {err['component']}: {err['code']}{extra}")
+    if not data["errors"]:lines.append("Нет зафиксированных ошибок за последние 24 ч")
+    if data["active_chats"]:
+        lines.append("\n📡 Недавно замеченные чаты (ID и дата последнего события):")
+        for item in data["active_chats"]:
+            lines.append(f"• {item['chat_id']}: {diagnostic_time(item['last_at'])}")
+    lines.append("\nЭто статистика полученных событий, а не гарантия, что все чаты Telegram подключены.")
+    lines.append("Подробнее: /diagnostics_chat ID")
+    return "\n".join(lines)
+
+async def diagnostics_report():
+    data=diagnostics_snapshot()
+    if not BOT_TOKEN:
+        return diagnostics_text(data,webhook_error=True)
+    try:
+        info=await telegram_api("getWebhookInfo",{})
+        return diagnostics_text(data,webhook=info if isinstance(info,dict) else None)
+    except Exception:
+        diagnostic_event("telegram","webhook_check_failed")
+        return diagnostics_text(data,webhook_error=True)
+
+def diagnostics_chat_text(chat_id):
+    with db() as c:
+        message=c.execute("""SELECT COUNT(*) AS n,COALESCE(SUM(deleted),0) AS deleted,
+            MAX(message_date) AS last_date,MAX(chat_title) AS title
+            FROM messages WHERE chat_id=?""",(int(chat_id),)).fetchone()
+        edit=c.execute("""SELECT COUNT(*) AS n,MAX(edited_at) AS last_date
+            FROM message_edits WHERE chat_id=?""",(int(chat_id),)).fetchone()
+        photos=c.execute("""SELECT COUNT(*) AS n,MAX(saved_at) AS last_date
+            FROM archived_photos WHERE chat_id=?""",(int(chat_id),)).fetchone()
+        ephem=c.execute("""SELECT COUNT(*) AS n,MAX(saved_at) AS last_date
+            FROM mtproto_photos WHERE chat_id=?""",(int(chat_id),)).fetchone()
+        activity=c.execute("""SELECT kind,MAX(received_at) AS last_at
+            FROM diagnostic_chat_activity WHERE chat_id=? GROUP BY kind""",(int(chat_id),)).fetchall()
+        alerts=c.execute("""SELECT created_at,component,code FROM diagnostic_events
+            WHERE chat_id=? ORDER BY id DESC LIMIT 3""",(int(chat_id),)).fetchall()
+    a={row["kind"]:row["last_at"] for row in activity}
+    if not message["n"] and not edit["n"] and not photos["n"] and not ephem["n"] and not a:
+        return f"Для чата {chat_id} данных пока нет."
+    lines=[f"🔎 Диагностика чата {chat_id}",
+           f"Название из архива: {message['title'] or 'нет'}",
+           f"В архиве сообщений: {message['n']} • удалённых: {message['deleted']}",
+           f"Последняя дата сообщения: {diagnostic_time(message['last_date'])}",
+           f"Последнее событие: новое {diagnostic_time(a.get('new'))}, "
+           f"изменение {diagnostic_time(a.get('edit'))}, удаление {diagnostic_time(a.get('delete'))}",
+           f"Редактирований: {edit['n']}; последнее {diagnostic_time(edit['last_date'])}",
+           f"Сохранено фото: {photos['n']} (последнее: {diagnostic_time(photos['last_date'])})",
+           f"Исчезающих фото MTProto: {ephem['n']}",
+           "Ошибки чата:"]
+    if alerts:
+        lines.extend(f"• {diagnostic_time(row['created_at'])} {row['component']}: {row['code']}" for row in alerts)
+    else:lines.append("нет зафиксированных")
+    lines.append("Для проверки истории: /edits "+str(chat_id))
+    return "\n".join(lines)
+
 def archive_usage():
     with db() as c:
         total=c.execute("SELECT COALESCE(SUM(input_tokens),0) AS input_tokens,COALESCE(SUM(output_tokens),0) AS output_tokens,COUNT(*) AS calls FROM api_usage").fetchone()
@@ -1324,7 +1568,7 @@ async def private_message(m):
         await send_text(chat_id,"Привет! Я Alexey AI. Отправь /id для настройки доступа." if not owner_ok(uid) else "Привет! Я на связи. Задай вопрос по архиву или отправь /help.");return
     if not owner_ok(uid):await send_text(chat_id,"Доступ закрыт. Владелец должен настроить BOT_OWNER_ID.");return
     if text.startswith("/help"):
-        await send_text(chat_id,"/status — состояние архива\n/deleted_on /deleted_off /deleted_status — журнал удалений\n/edits_on /edits_off /edits_status — уведомления об изменениях\n/edits ID [страница] — изменения в чате\n/edit_history ID MESSAGE_ID — все версии сообщения\n/photo_stats — сколько фотографий сохранено\n/expiring_status /expiring_list /expiring_send — архив исчезающих фото\n/chats — список чатов и их ID\n/analysis_status — ход последнего анализа\n/analysis_progress ID [номер] — сохранённые фрагменты\n/analysis_export ID — все промежуточные резюме\n/analyze_chat ID — запросить анализ чата (с подтверждением)\n/report_chat ID — показать сохранённый анализ чата\n/import — инструкция импорта JSON\n/search запрос — поиск по сообщениям\n/report [YYYY-MM-DD] — ежедневный отчёт\n/analyze [YYYY-MM-DD] — повторный анализ дня (с подтверждением)\n/confirm КОД — подтвердить платный анализ\n/cancel — отменить ожидающий анализ\n/notes — общие заметки из интеграции\n/stats — статистика архива\n/usage — расход токенов API\n/recent ID — последние сообщения чата\n/search_chat ID запрос — поиск в одном чате\n/help — помощь\nМожно задавать вопросы обычным текстом.");return
+        await send_text(chat_id,"/status — состояние архива\n/diagnostics — здоровье бота, архива, фото и Telegram\n/diagnostics_chat ID — проверка конкретного чата\n/deleted_on /deleted_off /deleted_status — журнал удалений\n/edits_on /edits_off /edits_status — уведомления об изменениях\n/edits ID [страница] — изменения в чате\n/edit_history ID MESSAGE_ID — все версии сообщения\n/photo_stats — сколько фотографий сохранено\n/expiring_status /expiring_list /expiring_send — архив исчезающих фото\n/chats — список чатов и их ID\n/analysis_status — ход последнего анализа\n/analysis_progress ID [номер] — сохранённые фрагменты\n/analysis_export ID — все промежуточные резюме\n/analyze_chat ID — запросить анализ чата (с подтверждением)\n/report_chat ID — показать сохранённый анализ чата\n/import — инструкция импорта JSON\n/search запрос — поиск по сообщениям\n/report [YYYY-MM-DD] — ежедневный отчёт\n/analyze [YYYY-MM-DD] — повторный анализ дня (с подтверждением)\n/confirm КОД — подтвердить платный анализ\n/cancel — отменить ожидающий анализ\n/notes — общие заметки из интеграции\n/stats — статистика архива\n/usage — расход токенов API\n/recent ID — последние сообщения чата\n/search_chat ID запрос — поиск в одном чате\n/help — помощь\nМожно задавать вопросы обычным текстом.");return
     if text=="/edits_on":
         set_edit_alerts_enabled(True)
         await send_text(chat_id,"✏️ Уведомления об изменениях включены. Каждая версия сохраняется.");return
@@ -1377,6 +1621,13 @@ async def private_message(m):
         with db() as c:
             notes=c.execute("SELECT subject,content,created_at FROM shared_notes ORDER BY id DESC LIMIT 10").fetchall()
         await send_long_text(chat_id,"Заметки из интеграции:\n\n"+"\n\n".join(f"{r['subject']}: {r['content'][:500]}" for r in notes) if notes else "Общих заметок пока нет.");return
+    if text=="/diagnostics":
+        await send_long_text(chat_id,await diagnostics_report());return
+    if text.startswith("/diagnostics_chat"):
+        args=text.split()
+        if len(args)!=2 or not args[1].lstrip("-").isdigit():
+            await send_text(chat_id,"Формат: /diagnostics_chat CHAT_ID");return
+        await send_long_text(chat_id,diagnostics_chat_text(int(args[1])));return
     if text.startswith("/stats"):
         await send_text(chat_id,archive_stats());return
     if text.startswith("/usage"):
@@ -1627,20 +1878,28 @@ async def webhook(request:Request,x_telegram_bot_api_secret_token:str|None=Heade
     try:
         if "business_connection" in update:save_connection(update["business_connection"])
         elif "business_message" in update:
-            save_message(update["business_message"])
-            await archive_business_photo(update["business_message"])
-            await archive_replied_business_photo(update["business_message"])
+            message=update["business_message"]
+            save_message(message)
+            await archive_business_photo(message)
+            await archive_replied_business_photo(message)
+            diagnostic_activity(message.get("business_connection_id"),(message.get("chat") or {}).get("id"),"new")
         elif "edited_business_message" in update:
-            edit_id=save_message(update["edited_business_message"],True,update_id=update_id)
-            await archive_business_photo(update["edited_business_message"])
-            await archive_replied_business_photo(update["edited_business_message"])
+            message=update["edited_business_message"]
+            edit_id=save_message(message,True,update_id=update_id)
+            await archive_business_photo(message)
+            await archive_replied_business_photo(message)
             if edit_id is not None:
                 await notify_edit(edit_id)
+            diagnostic_activity(message.get("business_connection_id"),(message.get("chat") or {}).get("id"),"edit")
         elif "deleted_business_messages" in update:
-            await handle_deleted_business_messages(update["deleted_business_messages"])
+            event=update["deleted_business_messages"]
+            await handle_deleted_business_messages(event)
+            diagnostic_activity(event.get("business_connection_id"),(event.get("chat") or {}).get("id"),"delete")
         elif "message" in update:await private_message(update["message"])
     except Exception:
-        log.exception("Failed Telegram update %s",update_id);raise HTTPException(500,"Update processing failed")
+        log.exception("Failed Telegram update %s",update_id)
+        diagnostic_event("webhook","update_processing_failed",severity="error")
+        raise HTTPException(500,"Update processing failed")
     if update_id is not None:
         with db() as c:c.execute("INSERT OR IGNORE INTO seen_updates(update_id,received_at) VALUES(?,?)",(int(update_id),int(datetime.now(timezone.utc).timestamp())))
     return {"ok":True}
