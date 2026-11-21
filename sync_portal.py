@@ -173,7 +173,7 @@ def make_router(db,zone,add_note):
         content='<nav><strong>🐗 Alexey AI</strong>'
         for label,path in links:
             content+=f'<a href="{_escape(url(request,path))}">{label}</a>'
-        if not (session_for(request) or {}).get("readonly",False):
+        if not (isinstance(session_for(request),dict) and session_for(request).get("readonly")):
             content+=('<form action="/bridge/logout" method="post" style="margin:0">'
                       '<button type="submit" class="btnlink">Выйти</button></form>')
         return content+"</nav>"
@@ -184,16 +184,18 @@ def make_router(db,zone,add_note):
     def login_page(error=""):
         msg=f'<p class="warn">{_escape(error)}</p>' if error else ""
         return _html("Вход",f"""<h1>🐗 Alexey AI - приватный архив</h1>
-<p>Чтобы открыть архив, отправь <code>/sync_link</code> боту
+<p>Для доступа к архиву без постоянного входа отправь <code>/sync_link</code> боту
 <a href="https://t.me/aialexey11_bot" target="_blank" rel="noopener noreferrer">@aialexey11_bot</a>
-со своего Telegram-аккаунта владельца. Он выдаст одноразовый код на 10 минут.</p>
+со своего Telegram-аккаунта владельца. Он выдаст персональную закрытую ссылку.
+Её нельзя публиковать: любой обладатель ссылки может читать архив.</p>
 {msg}
 <form method="post" action="/bridge/login">
 <label for="code">Одноразовый код из Telegram</label>
 <input id="code" name="code" autocomplete="off" spellcheck="false" required maxlength="80">
 <p><button type="submit">Подключить</button></p></form>
-<p class="muted">Сеанс браузера хранится 30 дней. Никому не отправляй код или ссылку с персональными данными.
-Архив остаётся на Railway, а ChatGPT получает доступ через авторизованный браузер только по твоим запросам.</p>""")
+<p class="muted">Старый вход по одноразовому коду оставлен только для ранее выданных кодов.
+Закрытая ссылка действует до /sync_revoke или следующей выдачи /sync_link.
+Не передавай её посторонним. Чтение архива по ссылке разрешено без cookie; запись заметок по ней запрещена.</p>""")
 
     @router.get("/bridge")
     async def portal_root(request:Request):
@@ -340,7 +342,7 @@ def make_router(db,zone,add_note):
                '<p class="muted">Записанные здесь факты можно читать из Telegram через /sync_notes. '
                'Никакой записи во внутреннюю память ChatGPT не происходит.</p>',
                ]
-        if not (session or {}).get("readonly",False):
+        if not (isinstance(session,dict) and session.get("readonly")):
             parts.extend([
                '<form action="/bridge/notes" method="post" class="card">',
                f'<input name="csrf" type="hidden" value="{_escape(session["csrf_token"])}">',
