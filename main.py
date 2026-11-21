@@ -1551,7 +1551,100 @@ def diagnostics_chat_text(chat_id):
     lines.append("Для проверки истории: /edits "+str(chat_id))
     return "\n".join(lines)
 
-def archive_usage():
+def add_shared_note(subject,content,source="telegram"):
+    """An explicit user-chosen note, never an automatic copy of a chat."""
+    if not isinstance(subject,str) or not 1<=len(subject.strip())<=150:
+        raise ValueError("Название заметки должно содержать 1-150 символов.")
+    if not isinstance(content,str) or not 1<=len(content.strip())<=8000:
+        raise ValueError("Текст заметки должен содержать 1-8000 символов.")
+    if source not in ("telegram","chatgpt"):raise ValueError("Invalid note source")
+    with db() as c:
+        cur=c.execute("""INSERT INTO shared_notes(created_at,source,subject,content)
+            VALUES(?,?,?,?)""",(int(datetime.now(timezone.utc).timestamp()),source,subject.strip(),content.strip()))
+        return cur.lastrowid
+
+def sync_status_text():
+    with db() as c:
+        stats=c.execute("""SELECT COUNT(*) AS n,
+            COALESCE(SUM(CASE WHEN source='telegram' THEN 1 ELSE 0 END),0) AS telegram
+            FROM shared_notes""").fetchone()
+    available=(bool(INTEGRATION_TOKEN) and len(INTEGRATION_TOKEN)>=32)
+    return (
+        "🔐 Синхронизация Alexey AI\n"
+        "Архив Telegram хранится на Railway. Внутренняя память ChatGPT не синхронизируется автоматически.\n"
+        f"Защищённый API: {'настроен' if available else 'не настроен'}.\n"
+        f"Общие заметки: {stats['n']} (создано в Telegram: {stats['telegram']}).\n\n"
+        "Передать переписку в ChatGPT: /sync_export CHAT_ID [1-200], "
+        "затем самостоятельно прикрепить полученный JSON к чату ChatGPT.\n"
+        "Сохранить общую заметку: /sync_note Тема | Текст.\n"
+        "Последние заметки: /sync_notes.\n"
+        "Передача данных осуществляется только по твоей команде."
+    )
+
+def sync_export_payload(chat_id,limit=100):
+    """Export up to 200 recent messages from ONE selected chat, in chronological order."""
+    if type(chat_id) is not int or chat_id==0:
+        raise ValueError("Не указан корректный ID чата.")
+    if type(limit) is not int or not 1<=limit<=200:
+        raise ValueError("Можно выгрузить от 1 до 200 сообщений за один раз.")
+    with db() as c:
+        rows=c.execute("""SELECT message_id,message_date,chat_title,sender_id,sender_name,
+            text,edited,deleted
+            FROM messages WHERE chat_id=?
+            ORDER BY message_date DESC,id DESC LIMIT ?""",
+            (chat_id,limit)).fetchall()
+    if not rows:raise ValueError("В архиве нет сообщений выбранного чата.")
+    ordered=list(reversed(rows))
+    return {
+        "format":"alexey-ai-chat-export-v1",
+        "chat_id":chat_id,
+        "chat_title":ordered[-1]["chat_title"] or "",
+        "exported_at":datetime.now(timezone.utc).isoformat(),
+        "count":len(ordered),
+        "includes_media_files":False,
+        "messages":[{
+            "message_id":r["message_id"],
+            "date":datetime.fromtimestamp(r["message_date"],timezone.utc).isoformat(),
+            "sender_id":r["sender_id"],
+            "sender":r["sender_name"],
+            "text":r["text"],
+            "edited":bool(r["edited"]),
+            "deleted":bool(r["deleted"])
+        } for r in ordered]
+    }
+
+async def send_sync_export(owner_id,chat_id,limit=100):
+    """Send the owner an explicit, bounded JSON export as a Telegram document."""
+    payload=sync_export_payload(chat_id,limit)
+    data=json.dumps(payload,ensure_ascii=False,indent=2).encode("utf-8")
+    if len(data)>3*1024*1024:raise ValueError("Выгрузка слишком большая. Уменьши число сообщений.")
+    if not BOT_TOKEN:raise RuntimeError("Telegram bot token is not configured")
+    name=f"alexey_ai_chat_{chat_id}_{int(datetime.now(timezone.utc).timestamp())}.json"
+    async with httpx.AsyncClient(timeout=60) as client:
+        response=await client.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
+            data={"chat_id":str(owner_id),
+                  "caption":f"📦 Архив чата {chat_id}, сообщений: {payload['count']}. "
+                            "Передавай файл в ChatGPT только если готов поделиться перепиской."},
+            files={"document":(name,data,"application/json")})
+    response.raise_for_status()
+    if not response.json().get("ok"):
+        raise RuntimeError("Telegram refused the archive export")
+    return payload["count"]
+
+def sync_notes_text(limit=15):
+    with db() as c:
+        rows=c.execute("""SELECT id,created_at,source,subject,content
+            FROM shared_notes ORDER BY id DESC LIMIT ?""",(limit,)).fetchall()
+    if not rows:return "Общих заметок пока нет. Добавь: /sync_note Тема | Текст."
+    lines=["📝 Общие заметки (последние):"]
+    for r in rows:
+        stamp=datetime.fromtimestamp(r["created_at"],LOCAL_TZ).strftime("%d.%m.%Y")
+        lines.append(f"\n#{r['id']} • {stamp} • {r['source']}\n"
+                     f"{r['subject']}\n{r['content'][:650]}")
+    return "\n".join(lines)
+
+
     with db() as c:
         total=c.execute("SELECT COALESCE(SUM(input_tokens),0) AS input_tokens,COALESCE(SUM(output_tokens),0) AS output_tokens,COUNT(*) AS calls FROM api_usage").fetchone()
         recent=c.execute("SELECT COALESCE(SUM(input_tokens),0) AS input_tokens,COALESCE(SUM(output_tokens),0) AS output_tokens,COUNT(*) AS calls FROM api_usage WHERE created_at>=?",(int(datetime.now(timezone.utc).timestamp())-86400,)).fetchone()
@@ -1568,7 +1661,7 @@ async def private_message(m):
         await send_text(chat_id,"Привет! Я Alexey AI. Отправь /id для настройки доступа." if not owner_ok(uid) else "Привет! Я на связи. Задай вопрос по архиву или отправь /help.");return
     if not owner_ok(uid):await send_text(chat_id,"Доступ закрыт. Владелец должен настроить BOT_OWNER_ID.");return
     if text.startswith("/help"):
-        await send_text(chat_id,"/status — состояние архива\n/diagnostics — здоровье бота, архива, фото и Telegram\n/diagnostics_chat ID — проверка конкретного чата\n/deleted_on /deleted_off /deleted_status — журнал удалений\n/edits_on /edits_off /edits_status — уведомления об изменениях\n/edits ID [страница] — изменения в чате\n/edit_history ID MESSAGE_ID — все версии сообщения\n/photo_stats — сколько фотографий сохранено\n/expiring_status /expiring_list /expiring_send — архив исчезающих фото\n/chats — список чатов и их ID\n/analysis_status — ход последнего анализа\n/analysis_progress ID [номер] — сохранённые фрагменты\n/analysis_export ID — все промежуточные резюме\n/analyze_chat ID — запросить анализ чата (с подтверждением)\n/report_chat ID — показать сохранённый анализ чата\n/import — инструкция импорта JSON\n/search запрос — поиск по сообщениям\n/report [YYYY-MM-DD] — ежедневный отчёт\n/analyze [YYYY-MM-DD] — повторный анализ дня (с подтверждением)\n/confirm КОД — подтвердить платный анализ\n/cancel — отменить ожидающий анализ\n/notes — общие заметки из интеграции\n/stats — статистика архива\n/usage — расход токенов API\n/recent ID — последние сообщения чата\n/search_chat ID запрос — поиск в одном чате\n/help — помощь\nМожно задавать вопросы обычным текстом.");return
+        await send_text(chat_id,"/status — состояние архива\n/diagnostics — здоровье бота, архива, фото и Telegram\n/diagnostics_chat ID — проверка конкретного чата\n/deleted_on /deleted_off /deleted_status — журнал удалений\n/edits_on /edits_off /edits_status — уведомления об изменениях\n/edits ID [страница] — изменения в чате\n/edit_history ID MESSAGE_ID — все версии сообщения\n/photo_stats — сколько фотографий сохранено\n/expiring_status /expiring_list /expiring_send — архив исчезающих фото\n/chats — список чатов и их ID\n/analysis_status — ход последнего анализа\n/analysis_progress ID [номер] — сохранённые фрагменты\n/analysis_export ID — все промежуточные резюме\n/analyze_chat ID — запросить анализ чата (с подтверждением)\n/report_chat ID — показать сохранённый анализ чата\n/import — инструкция импорта JSON\n/search запрос — поиск по сообщениям\n/report [YYYY-MM-DD] — ежедневный отчёт\n/analyze [YYYY-MM-DD] — повторный анализ дня (с подтверждением)\n/confirm КОД — подтвердить платный анализ\n/cancel — отменить ожидающий анализ\n/notes — общие заметки из интеграции\n/sync_status — состояние обмена ChatGPT ↔ Telegram\n/sync_note Тема | Текст — добавить общую заметку\n/sync_notes — показать общие заметки\n/sync_export CHAT_ID [1-200] — экспорт чата в ChatGPT\n/stats — статистика архива\n/usage — расход токенов API\n/recent ID — последние сообщения чата\n/search_chat ID запрос — поиск в одном чате\n/help — помощь\nМожно задавать вопросы обычным текстом.");return
     if text=="/edits_on":
         set_edit_alerts_enabled(True)
         await send_text(chat_id,"✏️ Уведомления об изменениях включены. Каждая версия сохраняется.");return
@@ -1617,6 +1710,31 @@ async def private_message(m):
         row={"chat_id":target_chat,"message_id":target_message,"chat_title":f"Чат {target_chat}",
              "sender_name":"Собеседник","message_date":record["saved_at"]}
         await send_archived_photo(chat_id,row,path);return
+    if text=="/sync_status":
+        await send_text(chat_id,sync_status_text());return
+    if text=="/sync_notes":
+        await send_long_text(chat_id,sync_notes_text());return
+    if text=="/sync_note" or text.startswith("/sync_note "):
+        raw=text[len("/sync_note"):].strip()
+        if "|" not in raw:
+            await send_text(chat_id,"Формат: /sync_note Тема | Текст заметки");return
+        subject,content=raw.split("|",1)
+        try:note_id=add_shared_note(subject,content,"telegram")
+        except ValueError as exc:
+            await send_text(chat_id,str(exc));return
+        await send_text(chat_id,f"✅ Общая заметка #{note_id} сохранена в Alexey AI. "
+                             "Она доступна через защищённый API при его подключении.");return
+    if text=="/sync_export" or text.startswith("/sync_export "):
+        args=text.split()
+        if (len(args) not in (2,3) or not args[1].lstrip("-").isdigit() or
+            (len(args)==3 and not args[2].isdigit())):
+            await send_text(chat_id,"Формат: /sync_export CHAT_ID [1-200]");return
+        chat_to_export=int(args[1])
+        limit=int(args[2]) if len(args)==3 else 100
+        try:await send_sync_export(chat_id,chat_to_export,limit)
+        except ValueError as exc:
+            await send_text(chat_id,str(exc));return
+        return
     if text.startswith("/notes"):
         with db() as c:
             notes=c.execute("SELECT subject,content,created_at FROM shared_notes ORDER BY id DESC LIMIT 10").fetchall()
@@ -1828,10 +1946,7 @@ async def integration_save_note(request:Request,authorization:str|None=Header(de
     subject=data.get("subject");content=data.get("content")
     if not isinstance(subject,str) or not 1<=len(subject.strip())<=150 or not isinstance(content,str) or not 1<=len(content.strip())<=8000:
         raise HTTPException(400,"subject (1-150) and content (1-8000) required")
-    with db() as c:
-        cursor=c.execute("INSERT INTO shared_notes(created_at,source,subject,content) VALUES(?,?,?,?)",
-                         (int(datetime.now(timezone.utc).timestamp()),"chatgpt",subject.strip(),content.strip()))
-        note_id=cursor.lastrowid
+    note_id=add_shared_note(subject,content,source="chatgpt")
     return {"ok":True,"note_id":note_id}
 
 @app.get("/health")
