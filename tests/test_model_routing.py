@@ -9,7 +9,9 @@ from pathlib import Path
 from unittest.mock import AsyncMock,patch
 
 import httpx
-import main
+
+# Import main lazily: test_smoke sets BOT_OWNER_ID and DATABASE_PATH at module collection.
+main=None
 from model_routing import (
     MINI,NANO,PREMIUM,route_question,token_cost_usd,projected_cost_usd,
     model_for_tier
@@ -18,6 +20,10 @@ from model_routing import (
 
 class SmartModelTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        global main
+        if main is None:
+            import main as loaded_main
+            main=loaded_main
         self.tmp=tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.patch_db=patch.object(main,"DATABASE_PATH",Path(self.tmp.name)/"archive.sqlite3")
@@ -148,7 +154,7 @@ class SmartModelTests(unittest.IsolatedAsyncioTestCase):
             msg={"chat":{"id":100,"type":"private"},"from":{"id":100}}
             question="Подробно проанализируй изменения общения с Иваном"
             await main.private_message({**msg,"text":"/deep "+question})
-            self.assertIn("Подтверждение",sent.await_args.args[1])
+            self.assertIn("Для подтверждения",sent.await_args.args[1])
             self.assertEqual(len(tasks),0)
             code=main.PENDING_ANALYSES[100]["code"]
             await main.private_message({**msg,"text":"/confirm wrong"})
