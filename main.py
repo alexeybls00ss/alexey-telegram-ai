@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, hashlib, json, logging, os, re, sqlite3
+import asyncio, hashlib, hmac, json, logging, os, re, sqlite3
 from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -18,6 +18,7 @@ BOT_OWNER_ID=os.getenv("BOT_OWNER_ID","").strip()
 OPENAI_MODEL=os.getenv("OPENAI_MODEL","gpt-5.4-mini").strip()
 WEBHOOK_SECRET=os.getenv("TELEGRAM_WEBHOOK_SECRET","").strip()
 WEBHOOK_URL=os.getenv("WEBHOOK_URL","").strip().rstrip("/")
+INTEGRATION_TOKEN=os.getenv("INTEGRATION_TOKEN","").strip()
 DATABASE_PATH=Path(os.getenv("DATABASE_PATH","./data/archive.sqlite3"))
 LOCAL_TZ=ZoneInfo(os.getenv("APP_TIMEZONE","Europe/Istanbul"))
 REPORT_LOCK=asyncio.Lock()
@@ -69,6 +70,7 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_daily_chat_summaries_date ON daily_chat_summaries(report_date DESC)")
         c.execute("CREATE TABLE IF NOT EXISTS analysis_chunk_cache(chat_id INTEGER,chunk_hash TEXT,summary TEXT,created_at INTEGER,PRIMARY KEY(chat_id,chunk_hash))")
         c.execute("CREATE TABLE IF NOT EXISTS api_usage(id INTEGER PRIMARY KEY AUTOINCREMENT,created_at INTEGER,model TEXT,input_tokens INTEGER,output_tokens INTEGER)")
+        c.execute("CREATE TABLE IF NOT EXISTS shared_notes(id INTEGER PRIMARY KEY AUTOINCREMENT,created_at INTEGER NOT NULL,source TEXT NOT NULL,subject TEXT NOT NULL,content TEXT NOT NULL)")
         c.execute("""CREATE TABLE IF NOT EXISTS contact_reports(
         target_id INTEGER PRIMARY KEY,chat_title TEXT NOT NULL,content TEXT NOT NULL,
         created_at INTEGER NOT NULL,message_count INTEGER NOT NULL,chat_count INTEGER NOT NULL,
@@ -621,7 +623,11 @@ async def private_message(m):
         await send_text(chat_id,"Привет! Я Alexey AI. Отправь /id для настройки доступа." if not owner_ok(uid) else "Привет! Я на связи. Задай вопрос по архиву или отправь /help.");return
     if not owner_ok(uid):await send_text(chat_id,"Доступ закрыт. Владелец должен настроить BOT_OWNER_ID.");return
     if text.startswith("/help"):
-        await send_text(chat_id,"/status — состояние архива\n/chats — список чатов и их ID\n/analyze_chat ID — анализ всей истории одного чата\n/report_chat ID — показать сохранённый анализ чата\n/import — инструкция импорта JSON\n/search запрос — поиск по сообщениям\n/report [YYYY-MM-DD] — ежедневный отчёт\n/analyze [YYYY-MM-DD] — повторный анализ дня\n/stats — статистика архива\n/usage — расход токенов API\n/recent ID — последние сообщения чата\n/search_chat ID запрос — поиск в одном чате\n/help — помощь\nМожно задавать вопросы обычным текстом.");return
+        await send_text(chat_id,"/status — состояние архива\n/chats — список чатов и их ID\n/analyze_chat ID — анализ всей истории одного чата\n/report_chat ID — показать сохранённый анализ чата\n/import — инструкция импорта JSON\n/search запрос — поиск по сообщениям\n/report [YYYY-MM-DD] — ежедневный отчёт\n/analyze [YYYY-MM-DD] — повторный анализ дня\n/notes — общие заметки из интеграции\n/stats — статистика архива\n/usage — расход токенов API\n/recent ID — последние сообщения чата\n/search_chat ID запрос — поиск в одном чате\n/help — помощь\nМожно задавать вопросы обычным текстом.");return
+    if text.startswith("/notes"):
+        with db() as c:
+            notes=c.execute("SELECT subject,content,created_at FROM shared_notes ORDER BY id DESC LIMIT 10").fetchall()
+        await send_long_text(chat_id,"Заметки из интеграции:\n\n"+"\n\n".join(f"{r['subject']}: {r['content'][:500]}" for r in notes) if notes else "Общих заметок пока нет.");return
     if text.startswith("/stats"):
         await send_text(chat_id,archive_stats());return
     if text.startswith("/usage"):
@@ -712,6 +718,66 @@ async def private_message(m):
         answer=await ask_ai(text);save_dialog("user",text);save_dialog("assistant",answer);await send_text(chat_id,answer)
     except Exception as e:
         log.exception("OpenAI request failed");await send_text(chat_id,f"Ошибка запроса к ИИ: {type(e).__name__}. Проверь API-ключ, модель и лимиты.")
+def require_integration(authorization:str|None):
+    # Dedicated credential; never reuse the Telegram bot token or webhook secret.
+    if not INTEGRATION_TOKEN or len(INTEGRATION_TOKEN)<32:
+        raise HTTPException(503,"Integration is not configured")
+    supplied=authorization[7:] if authorization and authorization.lower().startswith("bearer ") else ""
+    if not hmac.compare_digest(supplied,INTEGRATION_TOKEN):
+        raise HTTPException(401,"Unauthorized")
+
+@app.get("/integration/chats")
+async def integration_chats(authorization:str|None=Header(default=None)):
+    require_integration(authorization)
+    with db() as c:
+        rows=c.execute("SELECT chat_id,MAX(chat_title) AS title,COUNT(*) AS messages FROM messages WHERE deleted=0 GROUP BY chat_id ORDER BY MAX(message_date) DESC LIMIT 100").fetchall()
+    return {"chats":[dict(r) for r in rows]}
+
+@app.get("/integration/messages/{chat_id}")
+async def integration_messages(chat_id:int,limit:int=50,before_id:int|None=None,authorization:str|None=Header(default=None)):
+    require_integration(authorization)
+    if limit<1 or limit>200:raise HTTPException(400,"limit must be between 1 and 200")
+    with db() as c:
+        sql="SELECT m.id,m.message_id,m.message_date,m.chat_title,m.sender_id,m.sender_name,m.text,m.edited FROM messages m WHERE m.deleted=0 AND m.chat_id=?"
+        args=[chat_id]
+        if before_id is not None:
+            sql+=" AND m.id<?";args.append(before_id)
+        sql+=" ORDER BY m.id DESC LIMIT ?";args.append(limit)
+        rows=c.execute(sql,args).fetchall()
+    return {"chat_id":chat_id,"messages":[dict(r) for r in rows],"next_before_id":rows[-1]["id"] if rows else None}
+
+@app.get("/integration/report/{chat_id}")
+async def integration_report(chat_id:int,authorization:str|None=Header(default=None)):
+    require_integration(authorization)
+    report=get_contact_report(chat_id)
+    if not report:raise HTTPException(404,"No saved analysis for this chat")
+    return {"chat_id":chat_id,"report":report["content"],"created_at":report["created_at"]}
+
+@app.get("/integration/notes")
+async def integration_notes(limit:int=30,authorization:str|None=Header(default=None)):
+    require_integration(authorization)
+    if limit<1 or limit>100:raise HTTPException(400,"limit must be between 1 and 100")
+    with db() as c:
+        rows=c.execute("SELECT * FROM shared_notes ORDER BY id DESC LIMIT ?",(limit,)).fetchall()
+    return {"notes":[dict(r) for r in rows]}
+
+@app.post("/integration/notes")
+async def integration_save_note(request:Request,authorization:str|None=Header(default=None)):
+    require_integration(authorization)
+    raw=await request.body()
+    if len(raw)>12000:raise HTTPException(413,"Note too large")
+    try:data=json.loads(raw)
+    except (ValueError,TypeError):raise HTTPException(400,"Invalid JSON")
+    if not isinstance(data,dict):raise HTTPException(400,"Expected JSON object")
+    subject=data.get("subject");content=data.get("content")
+    if not isinstance(subject,str) or not 1<=len(subject.strip())<=150 or not isinstance(content,str) or not 1<=len(content.strip())<=8000:
+        raise HTTPException(400,"subject (1-150) and content (1-8000) required")
+    with db() as c:
+        cursor=c.execute("INSERT INTO shared_notes(created_at,source,subject,content) VALUES(?,?,?,?)",
+                         (int(datetime.now(timezone.utc).timestamp()),"chatgpt",subject.strip(),content.strip()))
+        note_id=cursor.lastrowid
+    return {"ok":True,"note_id":note_id}
+
 @app.get("/health")
 async def health():return {"status":"ok","service":"alexey-telegram-ai","version":"0.3.0"}
 @app.on_event("startup")
