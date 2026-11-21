@@ -197,7 +197,7 @@ class PhotoArchiveTests(unittest.IsolatedAsyncioTestCase):
             text_alert.assert_awaited_once()
             self.assertIn("[вложение: photo]",text_alert.await_args.args[1])
             missing_alert.assert_awaited_once()
-            self.assertIn("не было сохранено",missing_alert.await_args.args[1])
+            self.assertIn("недоступно",missing_alert.await_args.args[1])
 
 
 class ExpiringPhotoTests(unittest.IsolatedAsyncioTestCase):
