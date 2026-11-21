@@ -178,6 +178,90 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
             with main.db() as c:
                 self.assertEqual(c.execute("SELECT COUNT(*) FROM bridge_read_keys").fetchone()[0],0)
 
+    async def test_fast_period_feed_authorization_roles_and_boundaries(self):
+        """One request joins all chats with reliable sender ownership flags."""
+        from datetime import datetime
+        from urllib.parse import urlparse, parse_qs
+        start=int(datetime(2026,11,21,6,0,tzinfo=main.LOCAL_TZ).timestamp())
+        with main.db() as c:
+            c.execute("""INSERT INTO business_connections
+                (connection_id,user_id,is_enabled,rights_json,updated_at)
+                VALUES(?,?,?,?,?)""",("period-known",100,1,"{}",start))
+            records=[
+                ("period-known",9001,11,"Друг",200,"Друг",start+60,"Привет <приватно>",0,0),
+                ("period-known",9001,12,"Друг",100,"No Name",start+120,"Я ответил",0,0),
+                ("period-known",9002,13,"Знакомая",400,"Алиса",start+3600,"Доброе утро",1,1),
+                ("other-connection",9003,14,"Неизвестно",500,"No Name",start+7200,"Автор неясен",0,0),
+                ("period-known",9001,15,"Друг",200,"Друг",start-60,"Было раньше",0,0),
+                ("period-known",9001,16,"Друг",200,"Друг",start+86400,"Позже",0,0),
+            ]
+            c.executemany("""INSERT INTO messages
+                (connection_id,chat_id,message_id,chat_title,sender_id,sender_name,
+                 message_date,text,deleted,edited) VALUES(?,?,?,?,?,?,?,?,?,?)""",records)
+        url=create_read_link(main.db,"https://testserver")
+        token=parse_qs(urlparse(url).query)["access"][0]
+        bounds={"from_local":"2026-11-21T06:00","to_local":"2026-11-22T06:00"}
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app),
+                                     base_url="https://testserver") as client:
+            self.assertEqual((await client.get("/bridge/period",params=bounds)).status_code,401)
+            result=await client.get("/bridge/period",params={**bounds,"access":token})
+            self.assertEqual(result.status_code,200)
+            self.assertIn("сообщений: 4",result.text)
+            self.assertIn("Чатов с сообщениями: 3",result.text)
+            self.assertIn("Привет &lt;приватно&gt;",result.text)
+            self.assertIn("Владелец",result.text)
+            self.assertIn("Собеседник",result.text)
+            self.assertIn("Не определено",result.text)
+            self.assertIn("· удалено",result.text)
+            self.assertIn("· редактировано",result.text)
+            self.assertNotIn("Было раньше",result.text)
+            self.assertNotIn("Позже",result.text)
+            self.assertNotIn('Привет <приватно>',result.text)
+            self.assertIn('access=',result.text)
+            self.assertEqual((await client.get("/bridge/period",params={
+                **bounds,"access":token,"page_no":0})).status_code,400)
+            self.assertEqual((await client.get("/bridge/period",params={
+                "from_local":"2026-11-21T06:00","access":token})).status_code,400)
+            self.assertEqual((await client.get("/bridge/period",params={
+                "from_local":"2026-11-21T06:00",
+                "to_local":"2026-11-23T06:00","access":token})).status_code,400)
+            self.assertEqual((await client.get("/bridge/period",params={
+                "from_local":"2026-11-21T06:00",
+                "to_local":"2026-11-21T05:59","access":token})).status_code,400)
+            self.assertEqual((await client.get("/bridge/period",params={
+                "from_local":"garbage","to_local":"2026-11-21T08:00",
+                "access":token})).status_code,400)
+            revoke_read_link(main.db)
+            self.assertEqual((await client.get("/bridge/period",params={
+                **bounds,"access":token})).status_code,401)
+
+    async def test_fast_period_feed_paginated_for_busy_days(self):
+        from datetime import datetime
+        from urllib.parse import parse_qs,urlparse
+        start=int(datetime(2026,11,21,8,0,tzinfo=main.LOCAL_TZ).timestamp())
+        with main.db() as c:
+            c.execute("""INSERT INTO business_connections
+                (connection_id,user_id,is_enabled,rights_json,updated_at)
+                VALUES(?,?,?,?,?)""",("period-page",100,1,"{}",start))
+            c.executemany("""INSERT INTO messages(connection_id,chat_id,message_id,
+                chat_title,sender_id,sender_name,message_date,text) VALUES(?,?,?,?,?,?,?,?)""",
+                [("period-page",9100,i,"Активный чат",200,"Друг",start+i,f"line-{i}")
+                 for i in range(201)])
+        token=parse_qs(urlparse(create_read_link(main.db,"https://testserver")).query)["access"][0]
+        q={"from_local":"2026-11-21T08:00","to_local":"2026-11-21T12:00","access":token}
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app),
+                                      base_url="https://testserver") as client:
+            first=await client.get("/bridge/period",params=q)
+            self.assertIn("сообщений: 201",first.text)
+            self.assertIn("Следующая страница",first.text)
+            self.assertIn("line-199",first.text)
+            self.assertNotIn("line-200",first.text)
+            second=await client.get("/bridge/period",params={**q,"page_no":2})
+            self.assertEqual(second.status_code,200)
+            self.assertIn("line-200",second.text)
+            self.assertNotIn("Следующая страница",second.text)
+
+
 
 if __name__=="__main__":
     unittest.main()
