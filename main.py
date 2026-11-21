@@ -32,6 +32,7 @@ JOB_LAST_EDIT={}
 
 PENDING_ANALYSES={}
 AUTO_DAILY_ANALYSIS=os.getenv("AUTO_DAILY_ANALYSIS","true").lower() in ("true","1","yes")
+MIRROR_DEFAULT=os.getenv("MIRROR_DEFAULT","true").lower() in ("true","1","yes")
 class AnalysisBudgetExceeded(RuntimeError): pass
 DAILY_TASK=None
 app=FastAPI(title="Alexey Telegram AI",version="0.3.0")
@@ -80,6 +81,7 @@ def init_db():
         PRIMARY KEY(report_date,connection_id,chat_id))""")
         c.execute("CREATE INDEX IF NOT EXISTS idx_daily_chat_summaries_date ON daily_chat_summaries(report_date DESC)")
         c.execute("CREATE TABLE IF NOT EXISTS analysis_chunk_cache(chat_id INTEGER,chunk_hash TEXT,summary TEXT,created_at INTEGER,PRIMARY KEY(chat_id,chunk_hash))")
+        c.execute("CREATE TABLE IF NOT EXISTS bot_settings(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
         c.execute("""CREATE TABLE IF NOT EXISTS analysis_jobs(
         job_id TEXT PRIMARY KEY,owner_id INTEGER NOT NULL,progress_message_id INTEGER,
         kind TEXT NOT NULL,target TEXT NOT NULL,status TEXT NOT NULL,stage TEXT NOT NULL,
@@ -190,6 +192,59 @@ def save_message(m,edited=False):
          chat.get("username"),sender.get("id"),person_name(sender) or ("Алексей" if m.get("sender_business_bot") else "Неизвестно"),
          sender.get("username"),int(m.get("date") or datetime.now(timezone.utc).timestamp()),
          message_text(m),int(edited),int(bool(m.get("sender_business_bot")))))
+def mirror_enabled():
+    with db() as c:
+        row=c.execute("SELECT value FROM bot_settings WHERE key='mirror_enabled'").fetchone()
+    return row["value"]=="1" if row else MIRROR_DEFAULT
+
+def set_mirror_enabled(enabled):
+    with db() as c:
+        c.execute("""INSERT INTO bot_settings(key,value) VALUES('mirror_enabled',?)
+                     ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                  ("1" if enabled else "0",))
+
+async def mirror_business_message(m,edited=False):
+    """Best-effort copy of incoming Business updates. No media bytes or file_id in SQLite."""
+    if not BOT_OWNER_ID.isdigit() or not mirror_enabled():return
+    owner=int(BOT_OWNER_ID)
+    chat=m.get("chat") or {}
+    sender=m.get("from") or {}
+    title=chat.get("title") or " ".join(filter(None,[chat.get("first_name"),chat.get("last_name")])) or chat.get("username") or "Личный чат"
+    name=person_name(sender) or ("Отправлено от бизнес-аккаунта" if m.get("sender_business_bot") else "Неизвестный отправитель")
+    stamp=datetime.fromtimestamp(int(m.get("date") or datetime.now(timezone.utc).timestamp()),LOCAL_TZ).strftime("%d.%m.%Y %H:%M")
+    title=str(title)[:100]
+    heading=f"{'✏️ Изменено' if edited else '📩 Новое сообщение'}\nЧат: {title} (ID {chat.get('id')})\nОт: {name}\nВремя: {stamp} МСК\n"
+    if m.get("has_protected_content"):
+        await send_text(owner,heading+"\n[Защищённый контент: содержимое не копируется]")
+        return
+    body=str(m.get("text") or m.get("caption") or "")
+    photos=m.get("photo") or []
+    if photos and isinstance(photos,list):
+        file_id=(photos[-1] or {}).get("file_id")
+        if file_id:
+            try:
+                await telegram_api("sendPhoto",{
+                    "chat_id":owner,"photo":file_id,
+                    "caption":(heading+"\n"+body)[:1000],
+                    "has_spoiler":bool(m.get("has_media_spoiler"))})
+                if len(body)>740:
+                    await send_text(owner,"Подпись к фото (продолжение):\n"+body[740:3600])
+                return
+            except Exception:
+                log.warning("Photo could not be delivered to owner; sending text notice",exc_info=True)
+                await send_text(owner,heading+"\n[Фото недоступно через Bot API]\n"+body[:2000])
+                return
+    if not body:
+        kinds=[k for k in ("video","document","voice","audio","video_note","sticker","animation") if m.get(k)]
+        body=("[Вложение: "+", ".join(kinds)+"]") if kinds else "[Нет доступного текста или фото]"
+    await send_text(owner,heading+"\n"+body[:3200])
+
+async def deliver_mirror_safely(m,edited=False):
+    try:
+        await mirror_business_message(m,edited=edited)
+    except Exception:
+        log.exception("Could not mirror Business message to owner")
+
 def mark_deleted(x):
     cid=x.get("business_connection_id"); chat_id=(x.get("chat") or {}).get("id"); ids=x.get("message_ids") or []
     if not cid or chat_id is None or not ids:return
@@ -808,7 +863,15 @@ async def private_message(m):
         await send_text(chat_id,"Привет! Я Alexey AI. Отправь /id для настройки доступа." if not owner_ok(uid) else "Привет! Я на связи. Задай вопрос по архиву или отправь /help.");return
     if not owner_ok(uid):await send_text(chat_id,"Доступ закрыт. Владелец должен настроить BOT_OWNER_ID.");return
     if text.startswith("/help"):
-        await send_text(chat_id,"/status — состояние архива\n/chats — список чатов и их ID\n/analysis_status — ход последнего анализа\n/analysis_progress ID [номер] — сохранённые фрагменты\n/analysis_export ID — все промежуточные резюме\n/analyze_chat ID — запросить анализ чата (с подтверждением)\n/report_chat ID — показать сохранённый анализ чата\n/import — инструкция импорта JSON\n/search запрос — поиск по сообщениям\n/report [YYYY-MM-DD] — ежедневный отчёт\n/analyze [YYYY-MM-DD] — повторный анализ дня (с подтверждением)\n/confirm КОД — подтвердить платный анализ\n/cancel — отменить ожидающий анализ\n/notes — общие заметки из интеграции\n/stats — статистика архива\n/usage — расход токенов API\n/recent ID — последние сообщения чата\n/search_chat ID запрос — поиск в одном чате\n/help — помощь\nМожно задавать вопросы обычным текстом.");return
+        await send_text(chat_id,"/status — состояние архива\n/mirror_on /mirror_off /mirror_status — пересылка в личку\n/chats — список чатов и их ID\n/analysis_status — ход последнего анализа\n/analysis_progress ID [номер] — сохранённые фрагменты\n/analysis_export ID — все промежуточные резюме\n/analyze_chat ID — запросить анализ чата (с подтверждением)\n/report_chat ID — показать сохранённый анализ чата\n/import — инструкция импорта JSON\n/search запрос — поиск по сообщениям\n/report [YYYY-MM-DD] — ежедневный отчёт\n/analyze [YYYY-MM-DD] — повторный анализ дня (с подтверждением)\n/confirm КОД — подтвердить платный анализ\n/cancel — отменить ожидающий анализ\n/notes — общие заметки из интеграции\n/stats — статистика архива\n/usage — расход токенов API\n/recent ID — последние сообщения чата\n/search_chat ID запрос — поиск в одном чате\n/help — помощь\nМожно задавать вопросы обычным текстом.");return
+    if text=="/mirror_on":
+        set_mirror_enabled(True)
+        await send_text(chat_id,"📩 Пересылка новых сообщений и обычных фото включена.");return
+    if text=="/mirror_off":
+        set_mirror_enabled(False)
+        await send_text(chat_id,"🔕 Пересылка новых сообщений и фото выключена. Архивирование текста не изменилось.");return
+    if text=="/mirror_status":
+        await send_text(chat_id,"Пересылка Business-сообщений: "+("включена" if mirror_enabled() else "выключена")+".\nФото и файлы в БД не сохраняются.");return
     if text.startswith("/notes"):
         with db() as c:
             notes=c.execute("SELECT subject,content,created_at FROM shared_notes ORDER BY id DESC LIMIT 10").fetchall()
@@ -1051,8 +1114,12 @@ async def webhook(request:Request,x_telegram_bot_api_secret_token:str|None=Heade
             if c.execute("SELECT 1 FROM seen_updates WHERE update_id=?",(int(update_id),)).fetchone():return {"ok":True}
     try:
         if "business_connection" in update:save_connection(update["business_connection"])
-        elif "business_message" in update:save_message(update["business_message"])
-        elif "edited_business_message" in update:save_message(update["edited_business_message"],True)
+        elif "business_message" in update:
+            save_message(update["business_message"])
+            asyncio.create_task(deliver_mirror_safely(update["business_message"]))
+        elif "edited_business_message" in update:
+            save_message(update["edited_business_message"],True)
+            asyncio.create_task(deliver_mirror_safely(update["edited_business_message"],edited=True))
         elif "deleted_business_messages" in update:mark_deleted(update["deleted_business_messages"])
         elif "message" in update:await private_message(update["message"])
     except Exception:
