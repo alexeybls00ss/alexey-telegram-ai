@@ -65,6 +65,8 @@ def init_db():
         chat_title TEXT NOT NULL,summary TEXT NOT NULL,message_count INTEGER NOT NULL,
         PRIMARY KEY(report_date,connection_id,chat_id))""")
         c.execute("CREATE INDEX IF NOT EXISTS idx_daily_chat_summaries_date ON daily_chat_summaries(report_date DESC)")
+        c.execute("CREATE TABLE IF NOT EXISTS analysis_chunk_cache(chat_id INTEGER,chunk_hash TEXT,summary TEXT,created_at INTEGER,PRIMARY KEY(chat_id,chunk_hash))")
+        c.execute("CREATE TABLE IF NOT EXISTS api_usage(id INTEGER PRIMARY KEY AUTOINCREMENT,created_at INTEGER,model TEXT,input_tokens INTEGER,output_tokens INTEGER)")
         c.execute("""CREATE TABLE IF NOT EXISTS contact_reports(
         target_id INTEGER PRIMARY KEY,chat_title TEXT NOT NULL,content TEXT NOT NULL,
         created_at INTEGER NOT NULL,message_count INTEGER NOT NULL,chat_count INTEGER NOT NULL,
@@ -423,6 +425,10 @@ async def call_ai(instructions,input_text,timeout=180,max_output_tokens=2200):
                         continue
                     raise RuntimeError(f"OpenAI HTTP {r.status_code}: {detail}")
                 data=r.json()
+                usage=data.get("usage") or {}
+                if usage:
+                    with db() as c:
+                        c.execute("INSERT INTO api_usage(created_at,model,input_tokens,output_tokens) VALUES(?,?,?,?)",(int(datetime.now(timezone.utc).timestamp()),OPENAI_MODEL,int(usage.get("input_tokens") or 0),int(usage.get("output_tokens") or 0)))
                 break
             except (httpx.TimeoutException,httpx.NetworkError) as e:
                 if attempt==4:raise RuntimeError(f"OpenAI network error: {type(e).__name__}") from e
