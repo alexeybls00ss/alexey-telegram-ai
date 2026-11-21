@@ -21,6 +21,8 @@ WEBHOOK_SECRET=os.getenv("TELEGRAM_WEBHOOK_SECRET","").strip()
 WEBHOOK_URL=os.getenv("WEBHOOK_URL","").strip().rstrip("/")
 INTEGRATION_TOKEN=os.getenv("INTEGRATION_TOKEN","").strip()
 DATABASE_PATH=Path(os.getenv("DATABASE_PATH","./data/archive.sqlite3"))
+PHOTO_ARCHIVE_DIR=Path(os.getenv("PHOTO_ARCHIVE_DIR",str(DATABASE_PATH.parent/"photos")))
+PHOTO_LIMIT_BYTES=10*1024*1024
 LOCAL_TZ=ZoneInfo(os.getenv("APP_TIMEZONE","Europe/Moscow"))
 REPORT_LOCK=asyncio.Lock()
 ANALYSIS_BUDGET_USD=float(os.getenv("ANALYSIS_BUDGET_USD","0.10"))
@@ -81,6 +83,10 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_daily_chat_summaries_date ON daily_chat_summaries(report_date DESC)")
         c.execute("CREATE TABLE IF NOT EXISTS analysis_chunk_cache(chat_id INTEGER,chunk_hash TEXT,summary TEXT,created_at INTEGER,PRIMARY KEY(chat_id,chunk_hash))")
         c.execute("CREATE TABLE IF NOT EXISTS bot_settings(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
+        c.execute("""CREATE TABLE IF NOT EXISTS archived_photos(
+            connection_id TEXT NOT NULL,chat_id INTEGER NOT NULL,message_id INTEGER NOT NULL,
+            photo_unique_id TEXT NOT NULL,file_path TEXT NOT NULL,file_size INTEGER NOT NULL,
+            saved_at INTEGER NOT NULL,PRIMARY KEY(connection_id,chat_id,message_id))""")
         c.execute("""CREATE TABLE IF NOT EXISTS analysis_jobs(
         job_id TEXT PRIMARY KEY,owner_id INTEGER NOT NULL,progress_message_id INTEGER,
         kind TEXT NOT NULL,target TEXT NOT NULL,status TEXT NOT NULL,stage TEXT NOT NULL,
@@ -191,6 +197,116 @@ def save_message(m,edited=False):
          chat.get("username"),sender.get("id"),person_name(sender) or ("Алексей" if m.get("sender_business_bot") else "Неизвестно"),
          sender.get("username"),int(m.get("date") or datetime.now(timezone.utc).timestamp()),
          message_text(m),int(edited),int(bool(m.get("sender_business_bot")))))
+def photo_archive_path(connection_id,chat_id,message_id):
+    # Hash opaque IDs so the filenames reveal no chat IDs or names.
+    key=f"{connection_id}:{chat_id}:{message_id}".encode("utf-8")
+    return PHOTO_ARCHIVE_DIR/(hashlib.sha256(key).hexdigest()+".jpg")
+
+async def download_telegram_photo(file_path,destination):
+    """Download into a temporary file on the persistent volume, then rename atomically."""
+    if (not isinstance(file_path,str) or not file_path or
+        file_path.startswith("/") or "\\" in file_path or ".." in file_path or
+        "://" in file_path or "?" in file_path or "#" in file_path):
+        raise ValueError("Unexpected Telegram photo path")
+    PHOTO_ARCHIVE_DIR.mkdir(parents=True,exist_ok=True,mode=0o700)
+    os.chmod(PHOTO_ARCHIVE_DIR,0o700)
+    temp=destination.with_name(destination.name+".tmp-"+secrets.token_hex(8))
+    count=0
+    try:
+        url=f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+        async with httpx.AsyncClient(timeout=25) as client:
+            async with client.stream("GET",url) as response:
+                response.raise_for_status()
+                with temp.open("xb") as out:
+                    os.chmod(temp,0o600)
+                    async for chunk in response.aiter_bytes():
+                        count+=len(chunk)
+                        if count>PHOTO_LIMIT_BYTES:
+                            raise ValueError("Photo exceeds archive size limit")
+                        out.write(chunk)
+        if count==0:raise ValueError("Empty photo download")
+        os.replace(temp,destination)
+        os.chmod(destination,0o600)
+        return count
+    finally:
+        temp.unlink(missing_ok=True)
+
+async def archive_business_photo(message):
+    """Persist photos received from Telegram Business; never send them on receipt."""
+    if message.get("has_protected_content"):return False
+    photo=message.get("photo")
+    if not isinstance(photo,list) or not photo:return False
+    item=photo[-1] or {}
+    file_id=item.get("file_id")
+    unique_id=item.get("file_unique_id") or file_id
+    connection_id=message.get("business_connection_id")
+    chat_id=(message.get("chat") or {}).get("id")
+    message_id=message.get("message_id")
+    if not file_id or not connection_id or chat_id is None or message_id is None:return False
+    size=item.get("file_size")
+    if isinstance(size,int) and size>PHOTO_LIMIT_BYTES:
+        log.warning("Photo too large to archive for message %s",message_id)
+        return False
+    with db() as c:
+        old=c.execute("""SELECT file_path,photo_unique_id FROM archived_photos
+            WHERE connection_id=? AND chat_id=? AND message_id=?""",
+            (connection_id,chat_id,message_id)).fetchone()
+    if old and old["photo_unique_id"]==unique_id and Path(old["file_path"]).is_file():
+        return True
+    try:
+        result=await telegram_api("getFile",{"file_id":file_id})
+        remote_path=result.get("file_path")
+        remote_size=result.get("file_size")
+        if isinstance(remote_size,int) and remote_size>PHOTO_LIMIT_BYTES:
+            raise ValueError("File exceeds archive size limit")
+        destination=photo_archive_path(connection_id,chat_id,message_id)
+        written=await download_telegram_photo(remote_path,destination)
+        with db() as c:
+            c.execute("""INSERT INTO archived_photos(
+                connection_id,chat_id,message_id,photo_unique_id,file_path,file_size,saved_at)
+                VALUES(?,?,?,?,?,?,?)
+                ON CONFLICT(connection_id,chat_id,message_id) DO UPDATE SET
+                photo_unique_id=excluded.photo_unique_id,file_path=excluded.file_path,
+                file_size=excluded.file_size,saved_at=excluded.saved_at""",
+                (connection_id,chat_id,message_id,unique_id,str(destination),
+                 written,int(datetime.now(timezone.utc).timestamp())))
+        return True
+    except Exception as exc:
+        # Do not leak the bot token, file ID, or signed file URL into logs.
+        log.warning("Photo archiving failed for message %s: %s",message_id,type(exc).__name__)
+        return False
+
+def archived_photo_for_message(row):
+    with db() as c:
+        rec=c.execute("""SELECT file_path FROM archived_photos
+            WHERE connection_id=? AND chat_id=? AND message_id=?""",
+            (row["connection_id"],row["chat_id"],row["message_id"])).fetchone()
+    if not rec:return None
+    candidate=Path(rec["file_path"]).resolve()
+    root=PHOTO_ARCHIVE_DIR.resolve()
+    if not candidate.is_relative_to(root) or not candidate.is_file():return None
+    return candidate
+
+async def send_archived_photo(owner_id,row,photo_path):
+    original_time=datetime.fromtimestamp(row["message_date"],LOCAL_TZ).strftime("%d.%m.%Y %H:%M")
+    caption=(f"🗑 Удалённое фото\nЧат: {row['chat_title'] or row['chat_id']}\n"
+             f"Автор: {row['sender_name'] or 'Неизвестно'}\n"
+             f"Отправлено: {original_time}\nID: {row['message_id']}")
+    with photo_path.open("rb") as media:
+        async with httpx.AsyncClient(timeout=40) as client:
+            response=await client.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
+                data={"chat_id":str(owner_id),"caption":caption[:1000]},
+                files={"photo":("deleted-photo.jpg",media,"image/jpeg")})
+    response.raise_for_status()
+    if not response.json().get("ok"):
+        raise RuntimeError("Telegram rejected archived photo")
+
+def photo_archive_stats():
+    with db() as c:
+        row=c.execute("SELECT COUNT(*) AS n,COALESCE(SUM(file_size),0) AS bytes FROM archived_photos").fetchone()
+    return f"📷 Архив фотографий: {row['n']} шт., {row['bytes']/1024/1024:.1f} МБ.\nПапка: {PHOTO_ARCHIVE_DIR}"
+
 def deleted_alerts_enabled():
     """User setting for deletion notifications. Does not affect chat archiving."""
     with db() as c:
@@ -248,14 +364,24 @@ def deleted_notice(event,originals,unseen):
     return "\n".join(lines)
 
 async def handle_deleted_business_messages(event):
-    """Notify only on deletion, then update existing archive state.
-
-    Await notification before updating the deletion marker: a temporary
-    Telegram API failure leaves the update retryable.
-    """
+    """Notify only on deletion; re-send previously archived images if available."""
     originals,unseen=get_deleted_message_snapshot(event)
     if (originals or unseen) and BOT_OWNER_ID.isdigit() and deleted_alerts_enabled():
-        await send_long_text(int(BOT_OWNER_ID),deleted_notice(event,originals,unseen))
+        owner=int(BOT_OWNER_ID)
+        await send_long_text(owner,deleted_notice(event,originals,unseen))
+        for row in originals:
+            if "[вложение: photo]" not in (row["text"] or ""):
+                continue
+            path=archived_photo_for_message(row)
+            if path is None:
+                await send_text(owner,f"📷 Фото из удалённого сообщения #{row['message_id']} не было сохранено или недоступно.")
+                continue
+            try:
+                await send_archived_photo(owner,row,path)
+            except Exception as exc:
+                log.warning("Unable to send deleted photo %s: %s",
+                            row["message_id"],type(exc).__name__)
+                await send_text(owner,f"⚠️ Не удалось переслать сохранённое фото из сообщения #{row['message_id']}.")
     mark_deleted(event)
 
 def mark_deleted(x):
@@ -876,7 +1002,7 @@ async def private_message(m):
         await send_text(chat_id,"Привет! Я Alexey AI. Отправь /id для настройки доступа." if not owner_ok(uid) else "Привет! Я на связи. Задай вопрос по архиву или отправь /help.");return
     if not owner_ok(uid):await send_text(chat_id,"Доступ закрыт. Владелец должен настроить BOT_OWNER_ID.");return
     if text.startswith("/help"):
-        await send_text(chat_id,"/status — состояние архива\n/deleted_on /deleted_off /deleted_status — журнал удалений\n/chats — список чатов и их ID\n/analysis_status — ход последнего анализа\n/analysis_progress ID [номер] — сохранённые фрагменты\n/analysis_export ID — все промежуточные резюме\n/analyze_chat ID — запросить анализ чата (с подтверждением)\n/report_chat ID — показать сохранённый анализ чата\n/import — инструкция импорта JSON\n/search запрос — поиск по сообщениям\n/report [YYYY-MM-DD] — ежедневный отчёт\n/analyze [YYYY-MM-DD] — повторный анализ дня (с подтверждением)\n/confirm КОД — подтвердить платный анализ\n/cancel — отменить ожидающий анализ\n/notes — общие заметки из интеграции\n/stats — статистика архива\n/usage — расход токенов API\n/recent ID — последние сообщения чата\n/search_chat ID запрос — поиск в одном чате\n/help — помощь\nМожно задавать вопросы обычным текстом.");return
+        await send_text(chat_id,"/status — состояние архива\n/deleted_on /deleted_off /deleted_status — журнал удалений\n/photo_stats — сколько фотографий сохранено\n/chats — список чатов и их ID\n/analysis_status — ход последнего анализа\n/analysis_progress ID [номер] — сохранённые фрагменты\n/analysis_export ID — все промежуточные резюме\n/analyze_chat ID — запросить анализ чата (с подтверждением)\n/report_chat ID — показать сохранённый анализ чата\n/import — инструкция импорта JSON\n/search запрос — поиск по сообщениям\n/report [YYYY-MM-DD] — ежедневный отчёт\n/analyze [YYYY-MM-DD] — повторный анализ дня (с подтверждением)\n/confirm КОД — подтвердить платный анализ\n/cancel — отменить ожидающий анализ\n/notes — общие заметки из интеграции\n/stats — статистика архива\n/usage — расход токенов API\n/recent ID — последние сообщения чата\n/search_chat ID запрос — поиск в одном чате\n/help — помощь\nМожно задавать вопросы обычным текстом.");return
     if text=="/deleted_on":
         set_deleted_alerts_enabled(True)
         await send_text(chat_id,"🗑 Уведомления об удалённых сообщениях включены.");return
@@ -886,7 +1012,9 @@ async def private_message(m):
     if text=="/deleted_status":
         await send_text(chat_id,"🗑 Уведомления об удалённых сообщениях: "+
                         ("включены" if deleted_alerts_enabled() else "отключены")+
-                        ".\nБот пишет только об удалениях, без пересылки обычных сообщений.");return
+                        ".\nСохранённые фото отправляются только при удалении. Новые сообщения не пересылаются.");return
+    if text=="/photo_stats":
+        await send_text(chat_id,photo_archive_stats());return
     if text.startswith("/notes"):
         with db() as c:
             notes=c.execute("SELECT subject,content,created_at FROM shared_notes ORDER BY id DESC LIMIT 10").fetchall()
@@ -1131,8 +1259,10 @@ async def webhook(request:Request,x_telegram_bot_api_secret_token:str|None=Heade
         if "business_connection" in update:save_connection(update["business_connection"])
         elif "business_message" in update:
             save_message(update["business_message"])
+            await archive_business_photo(update["business_message"])
         elif "edited_business_message" in update:
             save_message(update["edited_business_message"],True)
+            await archive_business_photo(update["edited_business_message"])
         elif "deleted_business_messages" in update:
             await handle_deleted_business_messages(update["deleted_business_messages"])
         elif "message" in update:await private_message(update["message"])
