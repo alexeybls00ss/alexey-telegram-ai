@@ -62,3 +62,27 @@ Attach a persistent volume at /app/data. The app sets the Telegram webhook on st
 - The database contains private messages; restrict access and backups.
 - Revoke and rotate an exposed bot token immediately.
 - Telegram Business access can be revoked in Telegram settings.
+
+
+## Smart OpenAI API model routing (2026-11)
+
+The bot uses an explicit, allowlisted three-tier router:
+
+- **Simple lookups:** GPT-5.4 nano (gpt-5.4-nano), e.g. short questions asking who/where/when or to find a message.
+- **Chat analysis, all daily reports and ambiguous/complex questions:** GPT-5.4 mini (gpt-5.4-mini).
+- **Deep reasoning:** GPT-5.4 (gpt-5.4) ONLY after the owner sends /deep Твой вопрос and confirms the one-time code using /confirm CODE within 10 minutes. Unconfirmed text never activates this tier.
+
+Routing is rule-based: no extra classification API calls are billed. All analysis batches and automatic reports default to Mini; Nano is used for short, simple interactive questions only. No implicit premium escalation, including requests quoting archived text. /cancel cancels an awaiting request.
+
+Owner-only commands:
+
+- /model - model routing details and prices per 1M text tokens.
+- /usage - recorded successful API calls, token counts, estimated cost in USD for 24h, 30d and all time, by model.
+- /deep ВОПРОС - request a one-time confirmed premium question; maximum question length 1,800 characters.
+- /confirm CODE - confirm a pending premium question (or a supported analysis job).
+
+Price table (USD per 1M standard text tokens, checked 2026-11-21; input / cached input / output): Nano 0.20/0.02/1.25; Mini 0.75/0.075/4.50; GPT-5.4 2.50/0.25/15.00. See [OpenAI pricing](https://developers.openai.com/api/docs/pricing). These prices are a snapshot, not live billing. The [nano model page](https://developers.openai.com/api/docs/models/gpt-5.4-nano) marks a dated snapshot as deprecated; monitor model availability.
+
+The existing api_usage SQLite table is migrated without deleting legacy rows. New columns: tier, cached_input_tokens, estimated_cost_usd. Older rows have NULL cost and are excluded from USD totals; /usage labels the number of such rows. Costs are estimated from the Responses API usage for successful responses (including cached input) using the published token prices. It is not the authoritative OpenAI invoice: failed calls, tax, other API features or future pricing changes may differ.
+
+Existing ANALYSIS_BUDGET_USD (default 0.10) applies to multi-call analysis jobs. PREMIUM_BUDGET_USD (default 0.30) controls the estimated pre-call guard for a premium one-off request. These are best-effort estimates, not guaranteed payment ceilings. Configure billing/spend limits at OpenAI Platform. The legacy Railway variable OPENAI_MODEL is deliberately ignored after this change to prevent accidental global premium selection.
