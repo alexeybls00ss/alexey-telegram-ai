@@ -310,10 +310,13 @@ def make_router(db,zone,add_note):
     async def portal_search(request:Request,q:str=""):
         require(request)
         term=q.strip()[:120]
-        parts=['<h1>Поиск по архиву</h1><form action="/bridge/search" method="get">',
-               read_hidden(request),
-               '<label>Слово или фраза</label>'
-               f'<input name="q" value="{_escape(term)}"><p><button>Найти</button></p></form>']
+        parts=[]
+        parts.append('<h1>Поиск по архиву</h1>')
+        parts.append('<form action="/bridge/search" method="get">')
+        parts.append(read_hidden(request))
+        parts.append('<label>Слово или фраза</label>')
+        parts.append(f'<input name="q" value="{_escape(term)}">')
+        parts.append('<p><button>Найти</button></p></form>')
         if term:
             with db() as c:
                 rows=c.execute("""SELECT chat_id,chat_title,message_id,message_date,
