@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, json, logging, os, re, sqlite3
+import asyncio, hashlib, json, logging, os, re, sqlite3
 from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -202,7 +202,7 @@ async def summarize_contact_history(chat_title,rows):
     batches=[];batch=[];size=0
     for row in rows:
         line=contact_message_line(row)
-        if batch and (len(batch)>=35 or size+len(line)>18000):
+        if batch and (len(batch)>=100 or size+len(line)>28000):
             batches.append("\n".join(batch));batch=[];size=0
         batch.append(line);size+=len(line)
     if batch:batches.append("\n".join(batch))
@@ -214,14 +214,14 @@ async def summarize_contact_history(chat_title,rows):
     results=[]
     for index,piece in enumerate(batches,1):
         prompt=f"Чат: {chat_title}\nЧасть истории {index}/{len(batches)}:\n<messages>\n{piece}\n</messages>\n\nСделай подробное резюме этой части по хронологии. Сохрани важные даты, факты, договорённости и id сообщений."
-        results.append(await call_ai(instructions,prompt,max_output_tokens=1700))
+        results.append(await call_ai(instructions,prompt,max_output_tokens=1100))
     if len(results)==1:return results[0]
     merged=[]
     for i in range(0,len(results),4):
         prompt="\n\n".join(f"Часть {j+1}:\n{x}" for j,x in enumerate(results[i:i+4],i))
         merged.append(await call_ai(instructions,
             f"Объедини резюме фрагментов одной переписки в связное хронологическое резюме без повторов. Чат: {chat_title}\n{prompt}",
-            max_output_tokens=2200))
+            max_output_tokens=1500))
     if len(merged)==1:return merged[0]
     return await call_ai(instructions,
         f"Составь единый итоговый обзор истории переписки, объединив эти сводки. Не теряй даты, id и различия между участниками:\n"+"\n\n".join(merged),
