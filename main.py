@@ -1,6 +1,6 @@
 from __future__ import annotations
 import asyncio
-import secrets, contextvars, hashlib, hmac, json, logging, os, re, sqlite3
+import secrets, contextvars, hashlib, hmac, html, json, logging, os, re, sqlite3
 from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -21,7 +21,7 @@ WEBHOOK_SECRET=os.getenv("TELEGRAM_WEBHOOK_SECRET","").strip()
 WEBHOOK_URL=os.getenv("WEBHOOK_URL","").strip().rstrip("/")
 INTEGRATION_TOKEN=os.getenv("INTEGRATION_TOKEN","").strip()
 DATABASE_PATH=Path(os.getenv("DATABASE_PATH","./data/archive.sqlite3"))
-LOCAL_TZ=ZoneInfo(os.getenv("APP_TIMEZONE","Europe/Istanbul"))
+LOCAL_TZ=ZoneInfo(os.getenv("APP_TIMEZONE","Europe/Moscow"))
 REPORT_LOCK=asyncio.Lock()
 ANALYSIS_BUDGET_USD=float(os.getenv("ANALYSIS_BUDGET_USD","0.10"))
 INPUT_PRICE_PER_M=float(os.getenv("INPUT_PRICE_PER_M","0.75"))
@@ -289,7 +289,7 @@ async def generate_and_deliver_contact(contact_id,chat_id):
                 f"В архиве пока нет сообщений из личного чата с ID {contact_id}. "
                 "Проверь /chats: чат должен быть подключён в Telegram Business и в нём должны поступить сообщения после подключения.")
             return
-        await send_long_text(chat_id,report)
+        await send_formatted_report(chat_id,report)
     except Exception as e:
         log.exception("Contact analysis failed")
         await send_text(chat_id,f"Не удалось проанализировать чат: {str(e)[:500]}. Подробности записаны в журнал сервера.")
@@ -565,6 +565,42 @@ async def send_long_text(chat_id,text):
             if cut<1800:cut=3900
             part=remaining[:cut];remaining=remaining[cut:].lstrip()
         await send_text(chat_id,part)
+def report_to_html(text):
+    """Convert common model Markdown to safe, Telegram-supported HTML."""
+    converted=[]
+    for raw in text.split("\n"):
+        line=html.escape(raw,quote=False)
+        heading=re.match(r"^\s*#{1,6}\s+(.+)$",line)
+        if heading:
+            line=heading.group(1).strip()
+        line=re.sub(r"^\s*[-*]\s+","• ",line)
+        line=re.sub(r"\*\*(.+?)\*\*",r"<b>\1</b>",line)
+        line=re.sub(r"__(.+?)__",r"<b>\1</b>",line)
+        line=re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)",r"<i>\1</i>",line)
+        line=re.sub(r"([^`
+]+)`,r"<code>\1</code>",line)
+        if heading and not line.startswith("<b>"):
+            line="<b>"+line+"</b>"
+        converted.append(line)
+    return "\n".join(converted)
+
+async def send_formatted_report(chat_id,text):
+    remaining=text.strip()
+    while remaining:
+        if len(remaining)<=3000:
+            part,remaining=remaining,""
+        else:
+            cut=remaining.rfind("\n",0,3000)
+            if cut<1400:cut=3000
+            part,remaining=remaining[:cut],remaining[cut:].lstrip()
+        try:
+            await telegram_api("sendMessage",{"chat_id":chat_id,"text":report_to_html(part),"parse_mode":"HTML"})
+        except Exception:
+            log.exception("HTML formatting failed; sending report as plain text")
+            plain=re.sub(r"^\s*#{1,6}\s+","",part,flags=re.M)
+            plain=plain.replace("**","").replace("__","")
+            await send_text(chat_id,plain)
+
 def mark_report_sent(report_date):
     with db() as c:
         c.execute("UPDATE daily_reports SET sent_at=? WHERE report_date=?",
@@ -577,7 +613,7 @@ async def generate_and_deliver(day,chat_id,force=False):
                 report=await generate_daily_report(day,force=force)
             finally:
                 ACTIVE_ANALYSIS_BUDGET.reset(token)
-        await send_long_text(chat_id,report);mark_report_sent(day.isoformat())
+        await send_formatted_report(chat_id,report);mark_report_sent(day.isoformat())
     except Exception as e:
         log.exception("Manual daily report failed")
         await send_text(chat_id,f"Не удалось создать отчёт: {type(e).__name__}. Подробности записаны в журнал сервера.")
@@ -622,7 +658,7 @@ async def daily_scheduler():
                         if AUTO_DAILY_ANALYSIS and get_daily_report(key) is None:await generate_compact_daily_report(target)
                     saved=get_daily_report(key)
                 if saved is not None and saved["sent_at"] is None:
-                    await send_long_text(int(BOT_OWNER_ID),saved["content"]);mark_report_sent(key)
+                    await send_formatted_report(int(BOT_OWNER_ID),saved["content"]);mark_report_sent(key)
         except asyncio.CancelledError:raise
         except Exception:
             log.exception("Daily report scheduler failed")
@@ -745,7 +781,7 @@ async def private_message(m):
             if index>len(cached):
                 await send_text(chat_id,f"Сохранено только {len(cached)} фрагментов. Выбери номер от 1 до {len(cached)}.");return
             item=cached[index-1]
-            await send_long_text(chat_id,f"Чат {target_id}. Фрагмент {index}/{len(cached)}.\n\n"+item["summary"]);return
+            await send_formatted_report(chat_id,f"Чат {target_id}. Фрагмент {index}/{len(cached)}.\n\n"+item["summary"]);return
         await send_text(chat_id,f"Чат {target_id}: сообщений {count}; сохранённых фрагментов анализа: {len(cached)}.\nПоказать конкретный: /analysis_progress {target_id} 1\nВсе резюме: /analysis_export {target_id}\nКоличество фрагментов не показывает, выполняется ли анализ сейчас.");return
     if text.startswith("/analysis_export"):
         parts=text.split()
@@ -793,7 +829,7 @@ async def private_message(m):
         target_id=int(parts[1].strip());saved=get_contact_report(target_id)
         if not saved:
             await send_text(chat_id,f"Сохранённого анализа чата {target_id} пока нет. Запусти /analyze_chat {target_id}");return
-        await send_long_text(chat_id,saved["content"]);return
+        await send_formatted_report(chat_id,saved["content"]);return
     if text.startswith("/report"):
         parts=text.split(maxsplit=1)
         raw=parts[1].strip() if len(parts)>1 else get_latest_report_date()
