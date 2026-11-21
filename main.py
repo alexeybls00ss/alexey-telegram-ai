@@ -10,6 +10,8 @@ from fastapi import FastAPI, Header, HTTPException, Request
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"))
 log=logging.getLogger("alexey-telegram-ai")
+# Telegram Bot API URLs contain credentials: never log httpx request URLs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 BOT_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN","").strip()
 OPENAI_API_KEY=os.getenv("OPENAI_API_KEY","").strip()
 BOT_OWNER_ID=os.getenv("BOT_OWNER_ID","").strip()
@@ -578,6 +580,38 @@ async def ask_ai(question):
     "Отличай найденные факты из сообщений от предположений. Если данных нет, прямо скажи.")
     prompt=f"История нашего диалога с ботом:\n{hist or '[пусто]'}\n\nЕжедневные сводки:\n<daily_summaries>\n{digest_context or '[совпадений нет]'}\n</daily_summaries>\n\nФрагменты исходного архива:\n<archive>\n{archive}\n</archive>\n\nВопрос:\n{question}"
     return await call_ai(instructions,prompt,timeout=120,max_output_tokens=2600)
+def archive_stats():
+    with db() as c:
+        overall=c.execute("SELECT COUNT(*) AS n,COUNT(DISTINCT chat_id) AS chats,MIN(message_date) AS first_at,MAX(message_date) AS last_at FROM messages WHERE deleted=0").fetchone()
+        top=c.execute("SELECT chat_id,MAX(chat_title) AS title,COUNT(*) AS n FROM messages WHERE deleted=0 GROUP BY chat_id ORDER BY n DESC LIMIT 8").fetchall()
+    lines=[f"Архив: {overall['n']} сообщений, {overall['chats']} чатов."]
+    if overall["first_at"]:
+        lines.append("Период: "+datetime.fromtimestamp(overall["first_at"],LOCAL_TZ).strftime("%d.%m.%Y")+" - "+datetime.fromtimestamp(overall["last_at"],LOCAL_TZ).strftime("%d.%m.%Y"))
+    lines.append("Самые активные чаты:")
+    lines.extend(f"• {r['title'] or r['chat_id']} ({r['chat_id']}): {r['n']}" for r in top)
+    return "\n".join(lines)
+
+def archive_recent(chat_id,limit=20):
+    with db() as c:
+        rows=c.execute("SELECT m.*,b.user_id AS owner_user_id FROM messages m LEFT JOIN business_connections b ON b.connection_id=m.connection_id WHERE m.deleted=0 AND m.chat_id=? ORDER BY m.message_date DESC,m.message_id DESC LIMIT ?",(chat_id,limit)).fetchall()
+    return "Последние сообщения:\n\n"+"\n".join(contact_message_line(r)[:650] for r in reversed(rows)) if rows else "Сообщений этого чата пока нет."
+
+def archive_search_chat(chat_id,query,limit=20):
+    terms=search_terms(query)
+    if not terms:return "Укажи слова для поиска."
+    clause=" AND ".join("unicode_lower(m.text) LIKE ?" for _ in terms)
+    with db() as c:
+        rows=c.execute(f"SELECT m.*,b.user_id AS owner_user_id FROM messages m LEFT JOIN business_connections b ON b.connection_id=m.connection_id WHERE m.deleted=0 AND m.chat_id=? AND {clause} ORDER BY m.message_date DESC LIMIT ?",(chat_id,*[f"%{t}%" for t in terms],limit)).fetchall()
+    return "Найдено:\n\n"+"\n\n".join(contact_message_line(r)[:850] for r in rows) if rows else "Совпадений в этом чате нет."
+
+def archive_usage():
+    with db() as c:
+        total=c.execute("SELECT COALESCE(SUM(input_tokens),0) AS input_tokens,COALESCE(SUM(output_tokens),0) AS output_tokens,COUNT(*) AS calls FROM api_usage").fetchone()
+        recent=c.execute("SELECT COALESCE(SUM(input_tokens),0) AS input_tokens,COALESCE(SUM(output_tokens),0) AS output_tokens,COUNT(*) AS calls FROM api_usage WHERE created_at>=?",(int(datetime.now(timezone.utc).timestamp())-86400,)).fetchone()
+    def fmt(r):
+        return f"{r['calls']} запросов; вход: {r['input_tokens']:,}, выход: {r['output_tokens']:,} токенов"
+    return "Использование API (по сохранённым успешным ответам):\nЗа 24 часа: "+fmt(recent)+"\nВсего после включения учёта: "+fmt(total)+"\nЭто не остаток баланса и не сумма списаний. Для денег смотри OpenAI Platform Billing."
+
 async def private_message(m):
     chat=m.get("chat") or {}; sender=m.get("from") or {}; chat_id=chat.get("id"); uid=sender.get("id"); text=(m.get("text") or "").strip()
     if chat.get("type")!="private" or chat_id is None:return
@@ -587,7 +621,21 @@ async def private_message(m):
         await send_text(chat_id,"Привет! Я Alexey AI. Отправь /id для настройки доступа." if not owner_ok(uid) else "Привет! Я на связи. Задай вопрос по архиву или отправь /help.");return
     if not owner_ok(uid):await send_text(chat_id,"Доступ закрыт. Владелец должен настроить BOT_OWNER_ID.");return
     if text.startswith("/help"):
-        await send_text(chat_id,"/status — состояние архива\n/chats — список чатов и их ID\n/analyze_chat ID — анализ всей истории одного чата\n/report_chat ID — показать сохранённый анализ чата\n/import — инструкция импорта JSON\n/search запрос — поиск по сообщениям\n/report [YYYY-MM-DD] — ежедневный отчёт\n/analyze [YYYY-MM-DD] — повторный анализ дня\n/help — помощь\nМожно задавать вопросы обычным текстом.");return
+        await send_text(chat_id,"/status — состояние архива\n/chats — список чатов и их ID\n/analyze_chat ID — анализ всей истории одного чата\n/report_chat ID — показать сохранённый анализ чата\n/import — инструкция импорта JSON\n/search запрос — поиск по сообщениям\n/report [YYYY-MM-DD] — ежедневный отчёт\n/analyze [YYYY-MM-DD] — повторный анализ дня\n/stats — статистика архива\n/usage — расход токенов API\n/recent ID — последние сообщения чата\n/search_chat ID запрос — поиск в одном чате\n/help — помощь\nМожно задавать вопросы обычным текстом.");return
+    if text.startswith("/stats"):
+        await send_text(chat_id,archive_stats());return
+    if text.startswith("/usage"):
+        await send_text(chat_id,archive_usage());return
+    if text.startswith("/recent "):
+        parts=text.split()
+        if len(parts)!=2 or not parts[1].isdigit():
+            await send_text(chat_id,"Формат: /recent 7076188523");return
+        await send_long_text(chat_id,archive_recent(int(parts[1])));return
+    if text.startswith("/search_chat"):
+        parts=text.split(maxsplit=2)
+        if len(parts)<3 or not parts[1].isdigit():
+            await send_text(chat_id,"Формат: /search_chat 7076188523 встреча");return
+        await send_long_text(chat_id,archive_search_chat(int(parts[1]),parts[2]));return
     if text.startswith("/import"):
         await send_text(chat_id,"Чтобы загрузить старую переписку: отправь мне файл result.json как документ (не как фото). Поддерживается экспорт одного личного чата из Telegram Desktop → JSON. Импорт проверяет, что экспорт содержит твой BOT_OWNER_ID.");return
     document=m.get("document")
