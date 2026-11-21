@@ -338,5 +338,113 @@ class MTProtoIntegrationTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(app,"MT_PROTO_ENABLED",False):
             self.assertIn("отключён",app.mtproto_status_text())
 
+class MessageEditJournalTests(unittest.IsolatedAsyncioTestCase):
+    def example_message(self,mid,text,chat_id=937110):
+        return {
+            "business_connection_id":"edits-test-connection",
+            "chat":{"id":chat_id,"first_name":"Тестовый собеседник"},
+            "message_id":mid,
+            "date":1790000000,
+            "edit_date":1790000060,
+            "from":{"id":chat_id,"first_name":"Иван"},
+            "text":text
+        }
+
+    async def test_five_versions_are_preserved(self):
+        app=app_module()
+        app.init_db()
+        app.save_message(self.example_message(801,"Первая версия"))
+        values=["Вторая версия","Третья версия","Четвёртая версия","Пятая версия","Шестая версия"]
+        edit_ids=[]
+        for index,value in enumerate(values):
+            edit_ids.append(app.save_message(self.example_message(801,value),edited=True,
+                                             update_id=9900010+index))
+        with app.db() as c:
+            rows=c.execute("""SELECT * FROM message_edits
+                WHERE connection_id=? AND chat_id=? AND message_id=?
+                ORDER BY revision""",("edits-test-connection",937110,801)).fetchall()
+            current=c.execute("SELECT text FROM messages WHERE chat_id=937110 AND message_id=801").fetchone()
+        self.assertEqual([r["revision"] for r in rows],[1,2,3,4,5])
+        self.assertEqual(rows[0]["before_text"],"Первая версия")
+        self.assertEqual(rows[0]["after_text"],"Вторая версия")
+        self.assertEqual(rows[4]["before_text"],"Пятая версия")
+        self.assertEqual(rows[4]["after_text"],"Шестая версия")
+        self.assertEqual(current["text"],"Шестая версия")
+        history=app.message_edit_history(937110,801)
+        self.assertIn("Первая версия",history)
+        self.assertIn("Шестая версия",history)
+        self.assertIn("Редакция №5",history)
+        self.assertIn("/edit_history 937110 801",app.list_recent_edits(937110))
+        self.assertEqual(app.save_message(self.example_message(801,"Шестая версия"),edited=True,
+                                          update_id=9900014),edit_ids[-1])
+        with app.db() as c:
+            self.assertEqual(c.execute("SELECT COUNT(*) AS n FROM message_edits WHERE chat_id=937110").fetchone()["n"],5)
+
+    async def test_webhook_notifies_only_on_edit_and_escapes_html(self):
+        app=app_module()
+        app.init_db()
+        app.set_edit_alerts_enabled(True)
+        base=self.example_message(802,"Приезжай завтра <&>")
+        changed=self.example_message(802,"Не приезжай завтра <script>")
+        class Request:
+            def __init__(self,payload):self.payload=payload
+            async def json(self):return self.payload
+        with patch.object(app,"BOT_OWNER_ID","100"), \
+             patch.object(app,"WEBHOOK_SECRET","edits-test-secret"), \
+             patch.object(app,"telegram_api",new_callable=AsyncMock) as telegram, \
+             patch.object(app,"archive_business_photo",new_callable=AsyncMock), \
+             patch.object(app,"archive_replied_business_photo",new_callable=AsyncMock):
+            await app.webhook(Request({"update_id":9900020,"business_message":base}),
+                              x_telegram_bot_api_secret_token="edits-test-secret")
+            telegram.assert_not_awaited()
+            await app.webhook(Request({"update_id":9900021,"edited_business_message":changed}),
+                              x_telegram_bot_api_secret_token="edits-test-secret")
+            telegram.assert_awaited_once()
+            method,args=telegram.await_args.args
+            self.assertEqual(method,"sendMessage")
+            self.assertEqual(args["parse_mode"],"HTML")
+            self.assertIn("БЫЛО",args["text"])
+            self.assertIn("СТАЛО",args["text"])
+            self.assertIn("&lt;script&gt;",args["text"])
+            self.assertNotIn("<script>",args["text"])
+            self.assertIn("<s>",args["text"])
+            self.assertIn("<u>",args["text"])
+            with app.db() as c:
+                row=c.execute("SELECT notified_at FROM message_edits WHERE update_id=9900021").fetchone()
+            self.assertIsNotNone(row["notified_at"])
+            await app.webhook(Request({"update_id":9900021,"edited_business_message":changed}),
+                              x_telegram_bot_api_secret_token="edits-test-secret")
+            telegram.assert_awaited_once()
+
+    async def test_previous_version_unavailable_is_marked(self):
+        app=app_module()
+        app.init_db()
+        edit_id=app.save_message(self.example_message(803,"Уже отредактировано"),
+                                 edited=True,update_id=9900030)
+        row=app.get_edit_revision(edit_id)
+        self.assertIsNone(row["before_text"])
+        self.assertIn("не было получено",app.edit_notification_html(row))
+        self.assertIn("не было получено",app.message_edit_history(937110,803))
+        self.assertIn("Предыдущая версия",app.edit_diff_html(None,"Уже отредактировано"))
+
+    async def test_disable_alerts_keeps_history(self):
+        app=app_module()
+        app.init_db()
+        app.save_message(self.example_message(804,"До"))
+        edit_id=app.save_message(self.example_message(804,"После"),
+                                 edited=True,update_id=9900040)
+        app.set_edit_alerts_enabled(False)
+        try:
+            with patch.object(app,"BOT_OWNER_ID","100"), \
+                 patch.object(app,"telegram_api",new_callable=AsyncMock) as telegram:
+                await app.notify_edit(edit_id)
+                telegram.assert_not_awaited()
+        finally:
+            app.set_edit_alerts_enabled(True)
+        row=app.get_edit_revision(edit_id)
+        self.assertEqual(row["before_text"],"До")
+        self.assertEqual(row["after_text"],"После")
+        self.assertIsNotNone(row["notified_at"])
+
 if __name__=="__main__":
     unittest.main()
