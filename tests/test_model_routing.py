@@ -99,6 +99,23 @@ class SmartModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[0]["cached_input_tokens"],200)
         self.assertAlmostEqual(rows[0]["estimated_cost_usd"],0.000294)
 
+    async def test_ask_ai_routes_real_interactive_calls(self):
+        selections=[]
+        async def fake_call_ai(instructions,prompt,**kwargs):
+            selections.append((kwargs["tier"],kwargs["max_output_tokens"]))
+            return "answer"
+        with patch.object(main,"OPENAI_API_KEY","fake"), \
+             patch.object(main,"search_messages",return_value=[]), \
+             patch.object(main,"search_daily_chat_summaries",return_value=[]), \
+             patch.object(main,"recent_history",return_value=[]), \
+             patch.object(main,"call_ai",side_effect=fake_call_ai):
+            await main.ask_ai("Когда была последняя встреча?")
+            await main.ask_ai("Проанализируй отношения с человеком")
+            self.assertEqual(selections,[("simple",1000),("analysis",2600)])
+            with self.assertRaises(PermissionError):
+                await main.ask_ai("Пожалуйста углублённый ответ",tier="premium")
+            self.assertEqual(len(selections),2)
+
     async def test_estimated_budget_blocks_unapproved_cost(self):
         with patch.object(main,"OPENAI_API_KEY","test"):
             token=main.ACTIVE_ANALYSIS_BUDGET.set({"limit":0.000001,"spent":0.0})
