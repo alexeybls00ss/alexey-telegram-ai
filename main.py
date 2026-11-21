@@ -27,6 +27,9 @@ ANALYSIS_BUDGET_USD=float(os.getenv("ANALYSIS_BUDGET_USD","0.10"))
 INPUT_PRICE_PER_M=float(os.getenv("INPUT_PRICE_PER_M","0.75"))
 OUTPUT_PRICE_PER_M=float(os.getenv("OUTPUT_PRICE_PER_M","4.50"))
 ACTIVE_ANALYSIS_BUDGET=contextvars.ContextVar("analysis_budget",default=None)
+ACTIVE_ANALYSIS_JOB=contextvars.ContextVar("analysis_job",default=None)
+JOB_LAST_EDIT={}
+
 PENDING_ANALYSES={}
 AUTO_DAILY_ANALYSIS=os.getenv("AUTO_DAILY_ANALYSIS","true").lower() in ("true","1","yes")
 class AnalysisBudgetExceeded(RuntimeError): pass
@@ -77,6 +80,14 @@ def init_db():
         PRIMARY KEY(report_date,connection_id,chat_id))""")
         c.execute("CREATE INDEX IF NOT EXISTS idx_daily_chat_summaries_date ON daily_chat_summaries(report_date DESC)")
         c.execute("CREATE TABLE IF NOT EXISTS analysis_chunk_cache(chat_id INTEGER,chunk_hash TEXT,summary TEXT,created_at INTEGER,PRIMARY KEY(chat_id,chunk_hash))")
+        c.execute("""CREATE TABLE IF NOT EXISTS analysis_jobs(
+        job_id TEXT PRIMARY KEY,owner_id INTEGER NOT NULL,progress_message_id INTEGER,
+        kind TEXT NOT NULL,target TEXT NOT NULL,status TEXT NOT NULL,stage TEXT NOT NULL,
+        processed INTEGER NOT NULL DEFAULT 0,total INTEGER NOT NULL DEFAULT 0,
+        part INTEGER NOT NULL DEFAULT 0,parts INTEGER NOT NULL DEFAULT 0,
+        estimated_usd REAL NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL,
+        error TEXT)""")
+        c.execute("UPDATE analysis_jobs SET status='interrupted',stage='Сервер перезапущен во время анализа' WHERE status IN ('running','queued')")
         c.execute("CREATE TABLE IF NOT EXISTS api_usage(id INTEGER PRIMARY KEY AUTOINCREMENT,created_at INTEGER,model TEXT,input_tokens INTEGER,output_tokens INTEGER)")
         c.execute("CREATE TABLE IF NOT EXISTS shared_notes(id INTEGER PRIMARY KEY AUTOINCREMENT,created_at INTEGER NOT NULL,source TEXT NOT NULL,subject TEXT NOT NULL,content TEXT NOT NULL)")
         c.execute("""CREATE TABLE IF NOT EXISTS contact_reports(
@@ -91,7 +102,58 @@ async def telegram_api(method:str,payload:dict[str,Any]):
     if not data.get("ok"): raise RuntimeError(f"Telegram API error: {data}")
     return data.get("result",{})
 async def send_text(chat_id:int,text:str):
-    await telegram_api("sendMessage",{"chat_id":chat_id,"text":text if len(text)<=4000 else text[:3950]+"\n[Ответ сокращён]"})
+    return await telegram_api("sendMessage",{"chat_id":chat_id,"text":text if len(text)<=4000 else text[:3950]+"\n[Ответ сокращён]"})
+def create_analysis_job(kind,target,owner_id,progress_message_id):
+    job_id=secrets.token_hex(8)
+    with db() as c:
+        c.execute("""INSERT INTO analysis_jobs
+            (job_id,owner_id,progress_message_id,kind,target,status,stage,updated_at)
+            VALUES(?,?,?,?,?,?,?,?)""",
+            (job_id,int(owner_id),progress_message_id,kind,str(target),"queued",
+             "Ожидает запуска",int(datetime.now(timezone.utc).timestamp())))
+    return job_id
+
+def update_analysis_job(job_id,**changes):
+    if not job_id:return
+    allowed={"status","stage","processed","total","part","parts","estimated_usd","error"}
+    fields={k:v for k,v in changes.items() if k in allowed and v is not None}
+    fields["updated_at"]=int(datetime.now(timezone.utc).timestamp())
+    with db() as c:
+        c.execute("UPDATE analysis_jobs SET "+",".join(k+"=?" for k in fields)+" WHERE job_id=?",
+                  (*fields.values(),job_id))
+
+def analysis_status_text(row):
+    names={"queued":"⏳ В очереди","running":"🔄 Выполняется",
+           "finished":"✅ Готово","failed":"❌ Ошибка",
+           "interrupted":"⚠️ Прервано перезапуском"}
+    kind="День" if row["kind"]=="day" else "Чат"
+    info=[f"📊 Анализ: {kind} {row['target']}",
+          names.get(row["status"],row["status"]),row["stage"]]
+    if row["total"]:
+        info.append(f"Чатов/источников: {row['processed']}/{row['total']}")
+    if row["parts"]:
+        info.append(f"Фрагментов текущего чата: {row['part']}/{row['parts']}")
+    info.append(f"Оценочный расход: ~{row['estimated_usd']:.4f} USD (не точный биллинг)")
+    if row["error"]:info.append("Причина: "+row["error"][:240])
+    return "\n".join(info)
+
+async def report_analysis_progress(stage,force=False,**fields):
+    job_id=ACTIVE_ANALYSIS_JOB.get()
+    if not job_id:return
+    update_analysis_job(job_id,stage=stage,**fields)
+    now=asyncio.get_running_loop().time()
+    if not force and now-JOB_LAST_EDIT.get(job_id,0)<5:return
+    with db() as c:
+        row=c.execute("SELECT * FROM analysis_jobs WHERE job_id=?",(job_id,)).fetchone()
+    if not row or not row["progress_message_id"]:return
+    try:
+        await telegram_api("editMessageText",
+            {"chat_id":row["owner_id"],"message_id":row["progress_message_id"],
+             "text":analysis_status_text(row)})
+        JOB_LAST_EDIT[job_id]=now
+    except Exception:
+        log.warning("Could not edit analysis progress message",exc_info=True)
+
 def owner_ok(uid):
     try:return bool(BOT_OWNER_ID) and uid==int(BOT_OWNER_ID)
     except (TypeError,ValueError):return False
@@ -276,7 +338,8 @@ async def generate_contact_report(contact_id,force=True):
     save_contact_report(contact_id,title,report,len(rows),len(groups),
                         rows[0]["message_date"],rows[-1]["message_date"])
     return report
-async def generate_and_deliver_contact(contact_id,chat_id):
+async def generate_and_deliver_contact(contact_id,chat_id,job_id=None):
+    job_token=ACTIVE_ANALYSIS_JOB.set(job_id)
     try:
         async with REPORT_LOCK:
             context_token=ACTIVE_ANALYSIS_BUDGET.set({"limit":ANALYSIS_BUDGET_USD,"spent":0.0})
@@ -468,6 +531,8 @@ async def call_ai(instructions,input_text,timeout=180,max_output_tokens=2200):
                     else:
                         charged=projected
                     budget["spent"]+=charged
+                    if ACTIVE_ANALYSIS_JOB.get():
+                        update_analysis_job(ACTIVE_ANALYSIS_JOB.get(),estimated_usd=budget["spent"])
                 if usage:
                     with db() as c:
                         c.execute("INSERT INTO api_usage(created_at,model,input_tokens,output_tokens) VALUES(?,?,?,?)",(int(datetime.now(timezone.utc).timestamp()),OPENAI_MODEL,int(usage.get("input_tokens") or 0),int(usage.get("output_tokens") or 0)))
@@ -604,7 +669,8 @@ def mark_report_sent(report_date):
     with db() as c:
         c.execute("UPDATE daily_reports SET sent_at=? WHERE report_date=?",
                   (int(datetime.now(timezone.utc).timestamp()),report_date))
-async def generate_and_deliver(day,chat_id,force=False):
+async def generate_and_deliver(day,chat_id,force=False,job_id=None):
+    job_token=ACTIVE_ANALYSIS_JOB.set(job_id)
     try:
         async with REPORT_LOCK:
             token=ACTIVE_ANALYSIS_BUDGET.set({"limit":ANALYSIS_BUDGET_USD,"spent":0.0})
@@ -720,7 +786,7 @@ async def private_message(m):
         await send_text(chat_id,"Привет! Я Alexey AI. Отправь /id для настройки доступа." if not owner_ok(uid) else "Привет! Я на связи. Задай вопрос по архиву или отправь /help.");return
     if not owner_ok(uid):await send_text(chat_id,"Доступ закрыт. Владелец должен настроить BOT_OWNER_ID.");return
     if text.startswith("/help"):
-        await send_text(chat_id,"/status — состояние архива\n/chats — список чатов и их ID\n/analysis_progress ID [номер] — сохранённые фрагменты\n/analysis_export ID — все промежуточные резюме\n/analyze_chat ID — запросить анализ чата (с подтверждением)\n/report_chat ID — показать сохранённый анализ чата\n/import — инструкция импорта JSON\n/search запрос — поиск по сообщениям\n/report [YYYY-MM-DD] — ежедневный отчёт\n/analyze [YYYY-MM-DD] — повторный анализ дня (с подтверждением)\n/confirm КОД — подтвердить платный анализ\n/cancel — отменить ожидающий анализ\n/notes — общие заметки из интеграции\n/stats — статистика архива\n/usage — расход токенов API\n/recent ID — последние сообщения чата\n/search_chat ID запрос — поиск в одном чате\n/help — помощь\nМожно задавать вопросы обычным текстом.");return
+        await send_text(chat_id,"/status — состояние архива\n/chats — список чатов и их ID\n/analysis_status — ход последнего анализа\n/analysis_progress ID [номер] — сохранённые фрагменты\n/analysis_export ID — все промежуточные резюме\n/analyze_chat ID — запросить анализ чата (с подтверждением)\n/report_chat ID — показать сохранённый анализ чата\n/import — инструкция импорта JSON\n/search запрос — поиск по сообщениям\n/report [YYYY-MM-DD] — ежедневный отчёт\n/analyze [YYYY-MM-DD] — повторный анализ дня (с подтверждением)\n/confirm КОД — подтвердить платный анализ\n/cancel — отменить ожидающий анализ\n/notes — общие заметки из интеграции\n/stats — статистика архива\n/usage — расход токенов API\n/recent ID — последние сообщения чата\n/search_chat ID запрос — поиск в одном чате\n/help — помощь\nМожно задавать вопросы обычным текстом.");return
     if text.startswith("/notes"):
         with db() as c:
             notes=c.execute("SELECT subject,content,created_at FROM shared_notes ORDER BY id DESC LIMIT 10").fetchall()
@@ -765,6 +831,10 @@ async def private_message(m):
         return
     if text.startswith("/chats"):
         await send_long_text(chat_id,format_archived_chats());return
+    if text.startswith("/analysis_status"):
+        with db() as c:
+            row=c.execute("SELECT * FROM analysis_jobs WHERE owner_id=? ORDER BY updated_at DESC, rowid DESC LIMIT 1",(int(uid),)).fetchone()
+        await send_text(chat_id,analysis_status_text(row) if row else "Запусков анализа пока нет.");return
     if text.startswith("/analysis_progress"):
         parts=text.split()
         if len(parts) not in (2,3) or not parts[1].isdigit() or (len(parts)==3 and (not parts[2].isdigit() or int(parts[2])<1)):
@@ -806,12 +876,14 @@ async def private_message(m):
             await send_text(chat_id,"Подтверждение устарело (10 минут). Создай запрос заново.");return
         PENDING_ANALYSES.pop(int(uid),None)
         if pending["kind"]=="chat":
-            await send_text(chat_id,"Подтверждено. Запускаю анализ чата "+str(pending["value"])+".")
-            asyncio.create_task(generate_and_deliver_contact(pending["value"],chat_id))
+            msg=await send_text(chat_id,"Подтверждено. Готовлю анализ чата "+str(pending["value"])+".\nСтатус: /analysis_status")
+            job_id=create_analysis_job("chat",pending["value"],chat_id,msg.get("message_id"))
+            asyncio.create_task(generate_and_deliver_contact(pending["value"],chat_id,job_id=job_id))
         else:
             target=date.fromisoformat(pending["value"])
-            await send_text(chat_id,"Подтверждено. Запускаю повторный анализ дня "+target.isoformat()+".")
-            asyncio.create_task(generate_and_deliver(target,chat_id,force=True))
+            msg=await send_text(chat_id,"Подтверждено. Готовлю анализ дня "+target.isoformat()+".\nСтатус: /analysis_status")
+            job_id=create_analysis_job("day",target.isoformat(),chat_id,msg.get("message_id"))
+            asyncio.create_task(generate_and_deliver(target,chat_id,force=True,job_id=job_id))
         return
     if text.startswith("/analyze_chat"):
         parts=text.split(maxsplit=1)
