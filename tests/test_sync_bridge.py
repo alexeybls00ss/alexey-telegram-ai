@@ -121,7 +121,7 @@ class SyncBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(calls),1)
         self.assertIn("sendDocument",str(calls[0].url))
         self.assertIn(b"alexey-ai-chat-export-v1",calls[0].content)
-        self.assertNotIn(b"Текст другого чата",calls[0].content)
+        self.assertNotIn("Текст другого чата".encode("utf-8"),calls[0].content)
 
 
 if __name__=="__main__":
