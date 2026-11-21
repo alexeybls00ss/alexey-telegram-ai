@@ -20,6 +20,9 @@ Commands:
 - `/report YYYY-MM-DD` — show a report for a specific date.
 - `/analyze` — regenerate yesterday's report.
 - `/analyze YYYY-MM-DD` — regenerate a report for the specified date.
+- `/chats` — list chats currently present in the archive with their Telegram chat IDs and message counts.
+- `/analyze_chat CHAT_ID` — analyze the full archived history of one private chat, including both participants.
+- `/report_chat CHAT_ID` — retrieve the most recently saved analysis for that chat.
 
 The daily task runs inside the single Uvicorn process. Keep one replica / one worker for this deployment to avoid duplicate scheduled runs. If the service is down around the scheduled time, it catches up the previous day's missing report after the service comes back online.
 
@@ -28,6 +31,7 @@ The daily task runs inside the single Uvicorn process. Keep one replica / one wo
 - Only chats selected and permitted in the Telegram Business connection can be processed; this does not grant access to every Telegram chat, group or channel automatically.
 - Attachment contents are not downloaded or transcribed yet; only markers for photos, audio, documents and other attachment types are stored.
 - Search remains keyword-based with relevance ranking, not full semantic/vector search. Daily summaries improve context retrieval but do not replace original messages.
+- Selected-chat analysis uses the Telegram private chat ID (the private chat ID normally matches the other person's user ID). It selects the exact chat ID, not all messages authored by that user in groups.
 - The Telegram bot can answer questions using its own archive. This repository does not automatically connect this database to a separate ChatGPT conversation; reports can be retrieved from the bot and shared in ChatGPT.
 - AI summaries are generated from message text sent to the configured OpenAI API project. API billing is separate from ChatGPT.
 
