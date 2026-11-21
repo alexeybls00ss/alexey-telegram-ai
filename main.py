@@ -63,6 +63,13 @@ def init_db():
     with db() as c:
         c.execute("PRAGMA journal_mode=WAL")
         c.execute("CREATE TABLE IF NOT EXISTS seen_updates(update_id INTEGER PRIMARY KEY,received_at INTEGER NOT NULL)")
+        c.execute("""CREATE TABLE IF NOT EXISTS bridge_login_codes(
+            code_hash TEXT PRIMARY KEY,created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS bridge_sessions(
+            session_hash TEXT PRIMARY KEY,csrf_token TEXT NOT NULL,
+            created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL)""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_bridge_sessions_expiry ON bridge_sessions(expires_at)")
         c.execute("""CREATE TABLE IF NOT EXISTS diagnostic_events(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at INTEGER NOT NULL,
@@ -1574,7 +1581,8 @@ def sync_status_text():
         "Архив Telegram хранится на Railway. Внутренняя память ChatGPT не синхронизируется автоматически.\n"
         f"Защищённый API: {'настроен' if available else 'не настроен'}.\n"
         f"Общие заметки: {stats['n']} (создано в Telegram: {stats['telegram']}).\n\n"
-        "Передать переписку в ChatGPT: /sync_export CHAT_ID [1-200], "
+        "Прямой доступ через браузер: /sync_link.\n"
+        "Ручной экспорт: /sync_export CHAT_ID [1-200], "
         "затем самостоятельно прикрепить полученный JSON к чату ChatGPT.\n"
         "Сохранить общую заметку: /sync_note Тема | Текст.\n"
         "Последние заметки: /sync_notes.\n"
@@ -1661,7 +1669,7 @@ async def private_message(m):
         await send_text(chat_id,"Привет! Я Alexey AI. Отправь /id для настройки доступа." if not owner_ok(uid) else "Привет! Я на связи. Задай вопрос по архиву или отправь /help.");return
     if not owner_ok(uid):await send_text(chat_id,"Доступ закрыт. Владелец должен настроить BOT_OWNER_ID.");return
     if text.startswith("/help"):
-        await send_text(chat_id,"/status — состояние архива\n/diagnostics — здоровье бота, архива, фото и Telegram\n/diagnostics_chat ID — проверка конкретного чата\n/deleted_on /deleted_off /deleted_status — журнал удалений\n/edits_on /edits_off /edits_status — уведомления об изменениях\n/edits ID [страница] — изменения в чате\n/edit_history ID MESSAGE_ID — все версии сообщения\n/photo_stats — сколько фотографий сохранено\n/expiring_status /expiring_list /expiring_send — архив исчезающих фото\n/chats — список чатов и их ID\n/analysis_status — ход последнего анализа\n/analysis_progress ID [номер] — сохранённые фрагменты\n/analysis_export ID — все промежуточные резюме\n/analyze_chat ID — запросить анализ чата (с подтверждением)\n/report_chat ID — показать сохранённый анализ чата\n/import — инструкция импорта JSON\n/search запрос — поиск по сообщениям\n/report [YYYY-MM-DD] — ежедневный отчёт\n/analyze [YYYY-MM-DD] — повторный анализ дня (с подтверждением)\n/confirm КОД — подтвердить платный анализ\n/cancel — отменить ожидающий анализ\n/notes — общие заметки из интеграции\n/sync_status — состояние обмена ChatGPT ↔ Telegram\n/sync_note Тема | Текст — добавить общую заметку\n/sync_notes — показать общие заметки\n/sync_export CHAT_ID [1-200] — экспорт чата в ChatGPT\n/stats — статистика архива\n/usage — расход токенов API\n/recent ID — последние сообщения чата\n/search_chat ID запрос — поиск в одном чате\n/help — помощь\nМожно задавать вопросы обычным текстом.");return
+        await send_text(chat_id,"/status — состояние архива\n/diagnostics — здоровье бота, архива, фото и Telegram\n/diagnostics_chat ID — проверка конкретного чата\n/deleted_on /deleted_off /deleted_status — журнал удалений\n/edits_on /edits_off /edits_status — уведомления об изменениях\n/edits ID [страница] — изменения в чате\n/edit_history ID MESSAGE_ID — все версии сообщения\n/photo_stats — сколько фотографий сохранено\n/expiring_status /expiring_list /expiring_send — архив исчезающих фото\n/chats — список чатов и их ID\n/analysis_status — ход последнего анализа\n/analysis_progress ID [номер] — сохранённые фрагменты\n/analysis_export ID — все промежуточные резюме\n/analyze_chat ID — запросить анализ чата (с подтверждением)\n/report_chat ID — показать сохранённый анализ чата\n/import — инструкция импорта JSON\n/search запрос — поиск по сообщениям\n/report [YYYY-MM-DD] — ежедневный отчёт\n/analyze [YYYY-MM-DD] — повторный анализ дня (с подтверждением)\n/confirm КОД — подтвердить платный анализ\n/cancel — отменить ожидающий анализ\n/notes — общие заметки из интеграции\n/sync_status — состояние обмена ChatGPT ↔ Telegram\n/sync_link — безопасный вход ChatGPT в живой архив\n/sync_note Тема | Текст — добавить общую заметку\n/sync_notes — показать общие заметки\n/sync_export CHAT_ID [1-200] — экспорт чата в ChatGPT\n/stats — статистика архива\n/usage — расход токенов API\n/recent ID — последние сообщения чата\n/search_chat ID запрос — поиск в одном чате\n/help — помощь\nМожно задавать вопросы обычным текстом.");return
     if text=="/edits_on":
         set_edit_alerts_enabled(True)
         await send_text(chat_id,"✏️ Уведомления об изменениях включены. Каждая версия сохраняется.");return
@@ -1712,6 +1720,16 @@ async def private_message(m):
         await send_archived_photo(chat_id,row,path);return
     if text=="/sync_status":
         await send_text(chat_id,sync_status_text());return
+    if text=="/sync_link":
+        from sync_portal import create_login_code
+        code=create_login_code(db)
+        url=(WEBHOOK_URL or "https://alexey-telegram-ai-production.up.railway.app")+"/bridge"
+        await send_text(chat_id,"🔐 Подключение ChatGPT к архиву\n"
+                        f"Открой: {url}\n"
+                        f"Одноразовый код (действует 10 минут):\n{code}\n\n"
+                        "Введи его только на странице по ссылке. Не присылай код в ChatGPT. "
+                        "После входа браузер сможет читать архив и сохранять общие заметки.")
+        return
     if text=="/sync_notes":
         await send_long_text(chat_id,sync_notes_text());return
     if text=="/sync_note" or text.startswith("/sync_note "):
@@ -1948,6 +1966,10 @@ async def integration_save_note(request:Request,authorization:str|None=Header(de
         raise HTTPException(400,"subject (1-150) and content (1-8000) required")
     note_id=add_shared_note(subject,content,source="chatgpt")
     return {"ok":True,"note_id":note_id}
+
+# Owner-approved web archive: access is checked server-side for every request.
+from sync_portal import make_router as make_sync_portal_router
+app.include_router(make_sync_portal_router(db,LOCAL_TZ,add_shared_note))
 
 @app.get("/health")
 async def health():return {"status":"ok","service":"alexey-telegram-ai","version":"0.3.0"}
