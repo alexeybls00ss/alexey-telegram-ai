@@ -203,6 +203,90 @@ def set_mirror_enabled(enabled):
                      ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
                   ("1" if enabled else "0",))
 
+def is_expiring_photo(message):
+    """Telegram may expose TTL/view-once markers in some update formats."""
+    if not isinstance(message,dict) or not message.get("photo"):return False
+    candidates=[message,message.get("media"),message.get("photo_info")]
+    for item in candidates:
+        if not isinstance(item,dict):continue
+        for key in ("view_once","is_one_time","one_time","self_destruct","is_view_once"):
+            if item.get(key) is True:return True
+        for key in ("ttl_seconds","media_ttl_seconds"):
+            value=item.get(key)
+            if type(value) is int and value>0:return True
+    return False
+
+async def copy_photo_to_owner(file_id,caption,owner_id):
+    """Re-upload via RAM so the copy is independent of the original file_id.
+
+    No media bytes or downloaded file paths are stored in SQLite or on disk.
+    If the Bot API doesn't permit downloading, try sending by file_id.
+    """
+    if not file_id:return False
+    caption=caption[:980]
+    try:
+        info=await telegram_api("getFile",{"file_id":file_id})
+        size=int(info.get("file_size") or 0)
+        path=info.get("file_path")
+        max_bytes=10*1024*1024
+        if path and size<=max_bytes:
+            url=f"https://api.telegram.org/file/bot{BOT_TOKEN}/{path.lstrip('/')}"
+            data=bytearray()
+            async with httpx.AsyncClient(timeout=40) as client:
+                async with client.stream("GET",url) as result:
+                    result.raise_for_status()
+                    async for chunk in result.aiter_bytes():
+                        data.extend(chunk)
+                        if len(data)>max_bytes:
+                            raise ValueError("Photo exceeds Telegram sendPhoto upload size")
+                result=await client.post(
+                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
+                    data={"chat_id":str(owner_id),"caption":caption},
+                    files={"photo":("photo.jpg",bytes(data),"image/jpeg")})
+                result.raise_for_status()
+                if (result.json() or {}).get("ok"):
+                    return True
+    except Exception as exc:
+        # Never log authenticated URLs, raw media, file IDs, or the image.
+        log.info("In-memory photo transfer unavailable: %s",type(exc).__name__)
+    try:
+        await telegram_api("sendPhoto",
+            {"chat_id":owner_id,"photo":file_id,"caption":caption})
+        return True
+    except Exception as exc:
+        log.warning("Photo is not accessible through Bot API: %s",type(exc).__name__)
+        return False
+
+async def maybe_copy_replied_photo(message):
+    """A Business-account reply can include the original media in reply_to_message.
+
+    The /save_once reply must be sent BEFORE opening an expiring photo.
+    """
+    if not BOT_OWNER_ID.isdigit() or not mirror_enabled():return
+    sender=message.get("from") or {}
+    if sender.get("id")!=int(BOT_OWNER_ID):return
+    command=(message.get("text") or "").strip().split(" ",1)[0].lower()
+    original=message.get("reply_to_message") or {}
+    if not isinstance(original,dict):original={}
+    if command!="/save_once" and not is_expiring_photo(original):return
+    if original.get("has_protected_content"):
+        await send_text(int(BOT_OWNER_ID),"🔒 Медиа в ответе защищено от копирования.")
+        return
+    photos=original.get("photo") or []
+    if not isinstance(photos,list) or not photos:
+        if command=="/save_once":
+            await send_text(int(BOT_OWNER_ID),
+                "⚠️ Telegram не передал фото в reply_to_message. Через Bot API скачать его нельзя.")
+        return
+    if (original.get("from") or {}).get("id")==int(BOT_OWNER_ID):return
+    file_id=(photos[-1] or {}).get("file_id")
+    peer=person_name(original.get("from") or {}) or "Собеседник"
+    chat=message.get("chat") or {}
+    header=f"⏳ Фото из ответа\nЧат: {chat.get('first_name') or chat.get('title') or chat.get('id')}\nОт: {peer}\nID сообщения: {original.get('message_id')}"
+    if not await copy_photo_to_owner(file_id,header,int(BOT_OWNER_ID)):
+        await send_text(int(BOT_OWNER_ID),
+            header+"\n⚠️ Снимок не удалось получить через Bot API.")
+    
 async def mirror_business_message(m,edited=False):
     """Best-effort copy of incoming Business updates. No media bytes or file_id in SQLite."""
     if not BOT_OWNER_ID.isdigit() or not mirror_enabled():return
@@ -222,18 +306,24 @@ async def mirror_business_message(m,edited=False):
     if photos and isinstance(photos,list):
         file_id=(photos[-1] or {}).get("file_id")
         if file_id:
-            try:
-                await telegram_api("sendPhoto",{
-                    "chat_id":owner,"photo":file_id,
-                    "caption":(heading+"\n"+body)[:1000],
-                    "has_spoiler":bool(m.get("has_media_spoiler"))})
-                if len(body)>740:
-                    await send_text(owner,"Подпись к фото (продолжение):\n"+body[740:3600])
-                return
-            except Exception:
-                log.warning("Photo could not be delivered to owner; sending text notice",exc_info=True)
+            caption=(heading+"\n"+body)[:980]
+            if is_expiring_photo(m):
+                delivered=await copy_photo_to_owner(file_id,"⏳ Исчезающее фото\n"+caption,owner)
+            else:
+                try:
+                    await telegram_api("sendPhoto",{
+                        "chat_id":owner,"photo":file_id,
+                        "caption":caption,
+                        "has_spoiler":bool(m.get("has_media_spoiler"))})
+                    delivered=True
+                except Exception as exc:
+                    log.info("Direct photo send unavailable: %s",type(exc).__name__)
+                    delivered=await copy_photo_to_owner(file_id,caption,owner)
+            if not delivered:
                 await send_text(owner,heading+"\n[Фото недоступно через Bot API]\n"+body[:2000])
-                return
+            elif len(body)>740:
+                await send_text(owner,"Подпись к фото (продолжение):\n"+body[740:3600])
+            return
     if not body:
         kinds=[k for k in ("video","document","voice","audio","video_note","sticker","animation") if m.get(k)]
         body=("[Вложение: "+", ".join(kinds)+"]") if kinds else "[Нет доступного текста или фото]"
@@ -241,7 +331,9 @@ async def mirror_business_message(m,edited=False):
 
 async def deliver_mirror_safely(m,edited=False):
     try:
-        await mirror_business_message(m,edited=edited)
+        if (m.get("text") or "").strip().split(" ",1)[0].lower()!="/save_once":
+            await mirror_business_message(m,edited=edited)
+        await maybe_copy_replied_photo(m)
     except Exception:
         log.exception("Could not mirror Business message to owner")
 
@@ -863,7 +955,7 @@ async def private_message(m):
         await send_text(chat_id,"Привет! Я Alexey AI. Отправь /id для настройки доступа." if not owner_ok(uid) else "Привет! Я на связи. Задай вопрос по архиву или отправь /help.");return
     if not owner_ok(uid):await send_text(chat_id,"Доступ закрыт. Владелец должен настроить BOT_OWNER_ID.");return
     if text.startswith("/help"):
-        await send_text(chat_id,"/status — состояние архива\n/mirror_on /mirror_off /mirror_status — пересылка в личку\n/chats — список чатов и их ID\n/analysis_status — ход последнего анализа\n/analysis_progress ID [номер] — сохранённые фрагменты\n/analysis_export ID — все промежуточные резюме\n/analyze_chat ID — запросить анализ чата (с подтверждением)\n/report_chat ID — показать сохранённый анализ чата\n/import — инструкция импорта JSON\n/search запрос — поиск по сообщениям\n/report [YYYY-MM-DD] — ежедневный отчёт\n/analyze [YYYY-MM-DD] — повторный анализ дня (с подтверждением)\n/confirm КОД — подтвердить платный анализ\n/cancel — отменить ожидающий анализ\n/notes — общие заметки из интеграции\n/stats — статистика архива\n/usage — расход токенов API\n/recent ID — последние сообщения чата\n/search_chat ID запрос — поиск в одном чате\n/help — помощь\nМожно задавать вопросы обычным текстом.");return
+        await send_text(chat_id,"/status — состояние архива\n/mirror_on /mirror_off /mirror_status — пересылка в личку\n/save_once — ответом на исчезающее фото до открытия\n/chats — список чатов и их ID\n/analysis_status — ход последнего анализа\n/analysis_progress ID [номер] — сохранённые фрагменты\n/analysis_export ID — все промежуточные резюме\n/analyze_chat ID — запросить анализ чата (с подтверждением)\n/report_chat ID — показать сохранённый анализ чата\n/import — инструкция импорта JSON\n/search запрос — поиск по сообщениям\n/report [YYYY-MM-DD] — ежедневный отчёт\n/analyze [YYYY-MM-DD] — повторный анализ дня (с подтверждением)\n/confirm КОД — подтвердить платный анализ\n/cancel — отменить ожидающий анализ\n/notes — общие заметки из интеграции\n/stats — статистика архива\n/usage — расход токенов API\n/recent ID — последние сообщения чата\n/search_chat ID запрос — поиск в одном чате\n/help — помощь\nМожно задавать вопросы обычным текстом.");return
     if text=="/mirror_on":
         set_mirror_enabled(True)
         await send_text(chat_id,"📩 Пересылка новых сообщений и обычных фото включена.");return
@@ -871,7 +963,7 @@ async def private_message(m):
         set_mirror_enabled(False)
         await send_text(chat_id,"🔕 Пересылка новых сообщений и фото выключена. Архивирование текста не изменилось.");return
     if text=="/mirror_status":
-        await send_text(chat_id,"Пересылка Business-сообщений: "+("включена" if mirror_enabled() else "выключена")+".\nФото и файлы в БД не сохраняются.");return
+        await send_text(chat_id,"Пересылка Business-сообщений: "+("включена" if mirror_enabled() else "выключена")+".\nФото и файлы в БД не сохраняются. Для исчезающего фото: ответь на него /save_once до открытия.");return
     if text.startswith("/notes"):
         with db() as c:
             notes=c.execute("SELECT subject,content,created_at FROM shared_notes ORDER BY id DESC LIMIT 10").fetchall()
