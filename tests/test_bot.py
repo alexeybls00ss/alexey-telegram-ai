@@ -200,5 +200,93 @@ class PhotoArchiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("не было сохранено",missing_alert.await_args.args[1])
 
 
+class ExpiringPhotoTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reply_recovers_available_original_without_new_alert(self):
+        app=app_module()
+        app.init_db()
+        app.set_deleted_alerts_enabled(True)
+        parent={
+            "business_connection_id":"ephemeral-reply-connection",
+            "chat":{"id":936010,"first_name":"Тест"},
+            "message_id":160,"date":1790000001,
+            "from":{"id":100,"first_name":"Алексей"},
+            "text":"Ответ на фото",
+            "reply_to_message":{
+                "message_id":159,"date":1790000000,
+                "from":{"id":936010,"first_name":"Собеседник"},
+                "photo":[{"file_id":"test-view-once-photo",
+                          "file_unique_id":"unique-once","file_size":8}],
+                "ttl_seconds":2147483647
+            }
+        }
+        event={"business_connection_id":"ephemeral-reply-connection",
+               "chat":{"id":936010},"message_ids":[159]}
+
+        async def fake_download(remote_path,destination):
+            destination.parent.mkdir(parents=True,exist_ok=True)
+            destination.write_bytes(b"\xff\xd8photo\xff\xd9")
+            return destination.stat().st_size
+
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(app,"PHOTO_ARCHIVE_DIR",Path(directory)), \
+             patch.object(app,"BOT_OWNER_ID","100"), \
+             patch.object(app,"telegram_api",new_callable=AsyncMock) as api, \
+             patch.object(app,"download_telegram_photo",new_callable=AsyncMock,side_effect=fake_download), \
+             patch.object(app,"send_long_text",new_callable=AsyncMock) as text_alert, \
+             patch.object(app,"send_archived_photo",new_callable=AsyncMock) as photo_alert:
+            api.return_value={"file_path":"photos/once.jpg","file_size":9}
+            app.save_message(parent)
+            recovered=await app.archive_replied_business_photo(parent)
+            self.assertTrue(recovered)
+            text_alert.assert_not_awaited()
+            photo_alert.assert_not_awaited()
+            with app.db() as c:
+                row=c.execute("""SELECT source,is_ephemeral FROM archived_photos
+                    WHERE connection_id=? AND chat_id=? AND message_id=?""",
+                    ("ephemeral-reply-connection",936010,159)).fetchone()
+            self.assertEqual(row["source"],"reply")
+            self.assertEqual(row["is_ephemeral"],1)
+            self.assertIn("самоуничтожающееся",app.message_text(parent["reply_to_message"]))
+            await app.handle_deleted_business_messages(event)
+            photo_alert.assert_awaited_once()
+            self.assertEqual(photo_alert.await_args.args[1]["message_id"],159)
+
+    async def test_ttl_without_file_is_reported_but_not_fabricated(self):
+        app=app_module()
+        self.assertTrue(app.has_expiring_photo_marker({"ttl_seconds":2147483647}))
+        self.assertTrue(app.has_expiring_photo_marker({"media":{"ttl_seconds":20}}))
+        self.assertFalse(app.has_expiring_photo_marker({"has_media_spoiler":True}))
+        app.init_db()
+        app.save_message({
+            "business_connection_id":"ephemeral-missing-connection",
+            "chat":{"id":936011,"first_name":"Тест"},
+            "message_id":300,"date":1790000000,
+            "from":{"id":936011,"first_name":"Собеседник"},
+            "ttl_seconds":2147483647
+        })
+        event={"business_connection_id":"ephemeral-missing-connection",
+               "chat":{"id":936011},"message_ids":[300]}
+        with patch.object(app,"BOT_OWNER_ID","100"), \
+             patch.object(app,"send_long_text",new_callable=AsyncMock) as text_alert, \
+             patch.object(app,"send_text",new_callable=AsyncMock) as missing_alert:
+            await app.handle_deleted_business_messages(event)
+            text_alert.assert_awaited_once()
+            missing_alert.assert_awaited_once()
+            self.assertIn("недоступно",missing_alert.await_args.args[1])
+
+    async def test_reply_to_other_chat_not_archived(self):
+        app=app_module()
+        parent={
+            "business_connection_id":"ephemeral-reply-connection",
+            "chat":{"id":936010},
+            "reply_to_message":{
+                "chat":{"id":12345},"message_id":9,
+                "photo":[{"file_id":"foreign"}]
+            }
+        }
+        with patch.object(app,"archive_business_photo",new_callable=AsyncMock) as archive:
+            self.assertFalse(await app.archive_replied_business_photo(parent))
+            archive.assert_not_awaited()
+
 if __name__=="__main__":
     unittest.main()
