@@ -310,7 +310,7 @@ def make_router(db,zone,add_note):
     async def portal_search(request:Request,q:str=""):
         require(request)
         term=q.strip()[:120]
-        parts=['<h1>Поиск по архиву</h1><form action="/bridge/search" method="get">'
+        parts=['<h1>Поиск по архиву</h1><form action="/bridge/search" method="get">',
                read_hidden(request),
                '<label>Слово или фраза</label>'
                f'<input name="q" value="{_escape(term)}"><p><button>Найти</button></p></form>']
