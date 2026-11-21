@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, hashlib, hmac, json, logging, os, re, sqlite3
+import asyncio, contextvars, hashlib, hmac, json, logging, os, re, sqlite3
 from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -22,6 +22,11 @@ INTEGRATION_TOKEN=os.getenv("INTEGRATION_TOKEN","").strip()
 DATABASE_PATH=Path(os.getenv("DATABASE_PATH","./data/archive.sqlite3"))
 LOCAL_TZ=ZoneInfo(os.getenv("APP_TIMEZONE","Europe/Istanbul"))
 REPORT_LOCK=asyncio.Lock()
+ANALYSIS_BUDGET_USD=float(os.getenv("ANALYSIS_BUDGET_USD","0.10"))
+INPUT_PRICE_PER_M=float(os.getenv("INPUT_PRICE_PER_M","0.75"))
+OUTPUT_PRICE_PER_M=float(os.getenv("OUTPUT_PRICE_PER_M","4.50"))
+ACTIVE_ANALYSIS_BUDGET=contextvars.ContextVar("analysis_budget",default=None)
+class AnalysisBudgetExceeded(RuntimeError): pass
 DAILY_TASK=None
 app=FastAPI(title="Alexey Telegram AI",version="0.3.0")
 
@@ -271,7 +276,11 @@ async def generate_contact_report(contact_id,force=True):
 async def generate_and_deliver_contact(contact_id,chat_id):
     try:
         async with REPORT_LOCK:
-            report=await generate_contact_report(contact_id,force=True)
+            context_token=ACTIVE_ANALYSIS_BUDGET.set({"limit":ANALYSIS_BUDGET_USD,"spent":0.0})
+            try:
+                report=await generate_contact_report(contact_id,force=True)
+            finally:
+                ACTIVE_ANALYSIS_BUDGET.reset(context_token)
         if report is None:
             await send_text(chat_id,
                 f"В архиве пока нет сообщений из личного чата с ID {contact_id}. "
@@ -413,6 +422,16 @@ async def download_telegram_document(file_id):
             raise ValueError("Не удалось прочитать JSON. Нужен экспорт Telegram Desktop в формате JSON.") from e
 async def call_ai(instructions,input_text,timeout=180,max_output_tokens=2200):
     if not OPENAI_API_KEY:raise RuntimeError("OPENAI_API_KEY не настроен")
+    budget=ACTIVE_ANALYSIS_BUDGET.get()
+    if budget is not None:
+        # Conservative token estimate for mixed Cyrillic and Latin; not a hard billing cap.
+        estimated_input=(len(instructions)+len(input_text))//2+500
+        projected=(estimated_input*INPUT_PRICE_PER_M+max_output_tokens*OUTPUT_PRICE_PER_M)/1_000_000
+        if budget["spent"]+projected>budget["limit"]:
+            raise AnalysisBudgetExceeded(
+                "Лимит анализа $" + format(budget["limit"],".2f") +
+                " достигнут (оценка). Уже потрачено ~$" + format(budget["spent"],".4f") +
+                ". Готовые фрагменты сохранены.")
     async with httpx.AsyncClient(timeout=timeout) as client:
         for attempt in range(5):
             try:
@@ -439,6 +458,13 @@ async def call_ai(instructions,input_text,timeout=180,max_output_tokens=2200):
                     raise RuntimeError(f"OpenAI HTTP {r.status_code}: {detail}")
                 data=r.json()
                 usage=data.get("usage") or {}
+                if budget is not None:
+                    if usage:
+                        charged=(int(usage.get("input_tokens") or 0)*INPUT_PRICE_PER_M+
+                                 int(usage.get("output_tokens") or 0)*OUTPUT_PRICE_PER_M)/1_000_000
+                    else:
+                        charged=projected
+                    budget["spent"]+=charged
                 if usage:
                     with db() as c:
                         c.execute("INSERT INTO api_usage(created_at,model,input_tokens,output_tokens) VALUES(?,?,?,?)",(int(datetime.now(timezone.utc).timestamp()),OPENAI_MODEL,int(usage.get("input_tokens") or 0),int(usage.get("output_tokens") or 0)))
