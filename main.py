@@ -87,6 +87,11 @@ def init_db():
             connection_id TEXT NOT NULL,chat_id INTEGER NOT NULL,message_id INTEGER NOT NULL,
             photo_unique_id TEXT NOT NULL,file_path TEXT NOT NULL,file_size INTEGER NOT NULL,
             saved_at INTEGER NOT NULL,PRIMARY KEY(connection_id,chat_id,message_id))""")
+        media_columns={r["name"] for r in c.execute("PRAGMA table_info(archived_photos)").fetchall()}
+        if "is_ephemeral" not in media_columns:
+            c.execute("ALTER TABLE archived_photos ADD COLUMN is_ephemeral INTEGER NOT NULL DEFAULT 0")
+        if "source" not in media_columns:
+            c.execute("ALTER TABLE archived_photos ADD COLUMN source TEXT NOT NULL DEFAULT 'business'")
         c.execute("""CREATE TABLE IF NOT EXISTS analysis_jobs(
         job_id TEXT PRIMARY KEY,owner_id INTEGER NOT NULL,progress_message_id INTEGER,
         kind TEXT NOT NULL,target TEXT NOT NULL,status TEXT NOT NULL,stage TEXT NOT NULL,
@@ -167,11 +172,25 @@ def owner_ok(uid):
 def person_name(u):
     if not u:return None
     return (f"{u.get('first_name','')} {u.get('last_name','')}").strip() or u.get("username")
+def has_expiring_photo_marker(message):
+    """Recognize TTL/view-once hints only if Telegram exposes them."""
+    if not isinstance(message,dict):return False
+    for obj in (message,message.get("media"),message.get("photo_info")):
+        if not isinstance(obj,dict):continue
+        for key in ("view_once","is_view_once","is_one_time","one_time","self_destruct"):
+            if obj.get(key) is True:return True
+        for key in ("ttl_seconds","media_ttl_seconds"):
+            val=obj.get(key)
+            if type(val) is int and val>0:return True
+    return False
+
 def message_text(m):
     body=m.get("text") or m.get("caption") or ""
     kinds=("photo","video","document","voice","audio","video_note","sticker","animation","contact","location","venue","poll")
     found=[k for k in kinds if m.get(k)]
     if found: body=(body+"\n" if body else "")+"[вложение: "+", ".join(found)+"]"
+    if has_expiring_photo_marker(m):
+        body=(body+"\n" if body else "")+"[самоуничтожающееся медиа: доступность файла зависит от Telegram]"
     return body.strip() or "[сообщение без текстового содержимого]"
 def save_connection(x):
     with db() as c:
@@ -231,7 +250,7 @@ async def download_telegram_photo(file_path,destination):
     finally:
         temp.unlink(missing_ok=True)
 
-async def archive_business_photo(message):
+async def archive_business_photo(message,source="business"):
     """Persist photos received from Telegram Business; never send them on receipt."""
     if message.get("has_protected_content"):return False
     photo=message.get("photo")
@@ -252,6 +271,11 @@ async def archive_business_photo(message):
             WHERE connection_id=? AND chat_id=? AND message_id=?""",
             (connection_id,chat_id,message_id)).fetchone()
     if old and old["photo_unique_id"]==unique_id and Path(old["file_path"]).is_file():
+        if has_expiring_photo_marker(message):
+            with db() as c:
+                c.execute("""UPDATE archived_photos SET is_ephemeral=1
+                    WHERE connection_id=? AND chat_id=? AND message_id=?""",
+                    (connection_id,chat_id,message_id))
         return True
     try:
         result=await telegram_api("getFile",{"file_id":file_id})
@@ -263,18 +287,46 @@ async def archive_business_photo(message):
         written=await download_telegram_photo(remote_path,destination)
         with db() as c:
             c.execute("""INSERT INTO archived_photos(
-                connection_id,chat_id,message_id,photo_unique_id,file_path,file_size,saved_at)
-                VALUES(?,?,?,?,?,?,?)
+                connection_id,chat_id,message_id,photo_unique_id,file_path,file_size,saved_at,
+                is_ephemeral,source)
+                VALUES(?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(connection_id,chat_id,message_id) DO UPDATE SET
                 photo_unique_id=excluded.photo_unique_id,file_path=excluded.file_path,
-                file_size=excluded.file_size,saved_at=excluded.saved_at""",
+                file_size=excluded.file_size,saved_at=excluded.saved_at,
+                is_ephemeral=MAX(archived_photos.is_ephemeral,excluded.is_ephemeral),
+                source=excluded.source""",
                 (connection_id,chat_id,message_id,unique_id,str(destination),
-                 written,int(datetime.now(timezone.utc).timestamp())))
+                 written,int(datetime.now(timezone.utc).timestamp()),
+                 int(has_expiring_photo_marker(message)),source))
         return True
     except Exception as exc:
         # Do not leak the bot token, file ID, or signed file URL into logs.
         log.warning("Photo archiving failed for message %s: %s",message_id,type(exc).__name__)
         return False
+
+async def archive_replied_business_photo(message):
+    """Save original media that Telegram exposes within reply_to_message.
+
+    No separate /save_once command, and no alert until the original is deleted.
+    """
+    original=message.get("reply_to_message")
+    if not isinstance(original,dict) or not original.get("photo"):return False
+    if original.get("has_protected_content"):return False
+    chat=message.get("chat") or {}
+    replied_chat=original.get("chat") or {}
+    if replied_chat.get("id") not in (None,chat.get("id")):return False
+    if not message.get("business_connection_id") or chat.get("id") is None:return False
+    mid=original.get("message_id")
+    if type(mid) is not int:return False
+    normalized=dict(original)
+    normalized["business_connection_id"]=message["business_connection_id"]
+    normalized["chat"]=chat
+    with db() as c:
+        exists=c.execute("""SELECT id FROM messages WHERE
+            connection_id=? AND chat_id=? AND message_id=?""",
+            (normalized["business_connection_id"],chat["id"],mid)).fetchone()
+    if not exists:save_message(normalized)
+    return await archive_business_photo(normalized,source="reply")
 
 def archived_photo_for_message(row):
     with db() as c:
@@ -304,8 +356,15 @@ async def send_archived_photo(owner_id,row,photo_path):
 
 def photo_archive_stats():
     with db() as c:
-        row=c.execute("SELECT COUNT(*) AS n,COALESCE(SUM(file_size),0) AS bytes FROM archived_photos").fetchone()
-    return f"📷 Архив фотографий: {row['n']} шт., {row['bytes']/1024/1024:.1f} МБ.\nПапка: {PHOTO_ARCHIVE_DIR}"
+        row=c.execute("""SELECT COUNT(*) AS n,
+            COALESCE(SUM(file_size),0) AS bytes,
+            COALESCE(SUM(is_ephemeral),0) AS expiring,
+            COALESCE(SUM(CASE WHEN source='reply' THEN 1 ELSE 0 END),0) AS replies
+            FROM archived_photos""").fetchone()
+    return (f"📷 Архив фотографий: {row['n']} шт., {row['bytes']/1024/1024:.1f} МБ.\n"
+            f"Отмечено Telegram как исчезающие: {row['expiring']}.\n"
+            f"Получены через ответы: {row['replies']}.\n"
+            f"Папка: {PHOTO_ARCHIVE_DIR}")
 
 def deleted_alerts_enabled():
     """User setting for deletion notifications. Does not affect chat archiving."""
@@ -370,11 +429,12 @@ async def handle_deleted_business_messages(event):
         owner=int(BOT_OWNER_ID)
         await send_long_text(owner,deleted_notice(event,originals,unseen))
         for row in originals:
-            if "[вложение: photo]" not in (row["text"] or ""):
-                continue
+            body=row["text"] or ""
             path=archived_photo_for_message(row)
+            if path is None and "[вложение: photo]" not in body and "самоуничтожающееся медиа" not in body:
+                continue
             if path is None:
-                await send_text(owner,f"📷 Фото из удалённого сообщения #{row['message_id']} не было сохранено или недоступно.")
+                await send_text(owner,f"📷 Фото из удалённого сообщения #{row['message_id']} не было сохранено или недоступно через Bot API.")
                 continue
             try:
                 await send_archived_photo(owner,row,path)
@@ -1260,9 +1320,11 @@ async def webhook(request:Request,x_telegram_bot_api_secret_token:str|None=Heade
         elif "business_message" in update:
             save_message(update["business_message"])
             await archive_business_photo(update["business_message"])
+            await archive_replied_business_photo(update["business_message"])
         elif "edited_business_message" in update:
             save_message(update["edited_business_message"],True)
             await archive_business_photo(update["edited_business_message"])
+            await archive_replied_business_photo(update["edited_business_message"])
         elif "deleted_business_messages" in update:
             await handle_deleted_business_messages(update["deleted_business_messages"])
         elif "message" in update:await private_message(update["message"])
