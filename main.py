@@ -265,7 +265,7 @@ async def generate_and_deliver_contact(contact_id,chat_id):
         await send_long_text(chat_id,report)
     except Exception as e:
         log.exception("Contact analysis failed")
-        await send_text(chat_id,f"Не удалось проанализировать чат: {type(e).__name__}. Подробности записаны в журнал сервера.")
+        await send_text(chat_id,f"Не удалось проанализировать чат: {str(e)[:500]}. Подробности записаны в журнал сервера.")
 def format_archived_chats(limit=40):
     with db() as c:
         rows=c.execute("""SELECT chat_id,MAX(chat_title) AS chat_title,COUNT(*) AS n,
@@ -399,11 +399,34 @@ async def download_telegram_document(file_id):
 async def call_ai(instructions,input_text,timeout=180,max_output_tokens=2200):
     if not OPENAI_API_KEY:raise RuntimeError("OPENAI_API_KEY не настроен")
     async with httpx.AsyncClient(timeout=timeout) as client:
-        r=await client.post("https://api.openai.com/v1/responses",
-            headers={"Authorization":f"Bearer {OPENAI_API_KEY}"},
-            json={"model":OPENAI_MODEL,"instructions":instructions,"input":input_text,
-                  "max_output_tokens":max_output_tokens})
-        r.raise_for_status();data=r.json()
+        for attempt in range(5):
+            try:
+                r=await client.post("https://api.openai.com/v1/responses",
+                    headers={"Authorization":f"Bearer {OPENAI_API_KEY}"},
+                    json={"model":OPENAI_MODEL,"instructions":instructions,"input":input_text,
+                          "max_output_tokens":max_output_tokens})
+                if r.status_code>=400:
+                    try:
+                        detail=(r.json().get("error") or {}).get("message") or r.text
+                    except (ValueError,TypeError,AttributeError):
+                        detail=r.text
+                    detail=str(detail).replace(OPENAI_API_KEY,"[REDACTED]")[:350]
+                    if r.status_code in (408,429,500,502,503,504) and attempt<4:
+                        wait=min(60,2**attempt*4)
+                        retry_after=r.headers.get("retry-after")
+                        if retry_after:
+                            try:wait=min(120,max(wait,float(retry_after)))
+                            except ValueError:pass
+                        log.warning("OpenAI temporary HTTP %s; retry %s/4 in %.1fs: %s",
+                                    r.status_code,attempt+1,wait,detail)
+                        await asyncio.sleep(wait)
+                        continue
+                    raise RuntimeError(f"OpenAI HTTP {r.status_code}: {detail}")
+                data=r.json()
+                break
+            except (httpx.TimeoutException,httpx.NetworkError) as e:
+                if attempt==4:raise RuntimeError(f"OpenAI network error: {type(e).__name__}") from e
+                await asyncio.sleep(min(60,2**attempt*4))
     parts=[x["text"] for item in data.get("output",[]) if item.get("type")=="message"
            for x in item.get("content",[]) if x.get("type")=="output_text" and x.get("text")]
     answer="\n".join(parts).strip()
