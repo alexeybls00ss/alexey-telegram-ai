@@ -577,8 +577,7 @@ def report_to_html(text):
         line=re.sub(r"\*\*(.+?)\*\*",r"<b>\1</b>",line)
         line=re.sub(r"__(.+?)__",r"<b>\1</b>",line)
         line=re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)",r"<i>\1</i>",line)
-        line=re.sub(r"([^`
-]+)`,r"<code>\1</code>",line)
+        line=line.replace(chr(96),"")
         if heading and not line.startswith("<b>"):
             line="<b>"+line+"</b>"
         converted.append(line)
