@@ -285,7 +285,7 @@ async def daily_scheduler():
     while True:
         try:
             now=datetime.now(LOCAL_TZ)
-            if now.hour==0 and now.minute>=5 and BOT_OWNER_ID.isdigit() and int(BOT_OWNER_ID)>0:
+            if (now.hour>0 or now.minute>=5) and BOT_OWNER_ID.isdigit() and int(BOT_OWNER_ID)>0:
                 target=now.date()-timedelta(days=1);key=target.isoformat()
                 saved=get_daily_report(key)
                 if saved is None:
@@ -328,9 +328,10 @@ async def private_message(m):
     if text.startswith("/report"):
         parts=text.split(maxsplit=1)
         raw=parts[1].strip() if len(parts)>1 else get_latest_report_date()
-        try:target=date.fromisoformat(raw) if raw else None
-        except ValueError:target=None
-        if target is None:
+        if not raw:
+            await send_text(chat_id,"Ежедневных отчётов пока нет. Запусти /analyze без даты, чтобы разобрать вчерашний день.");return
+        try:target=date.fromisoformat(raw)
+        except ValueError:
             await send_text(chat_id,"Укажи дату в формате YYYY-MM-DD. Например: /report 2026-11-20");return
         saved=get_daily_report(target.isoformat())
         if not saved:
