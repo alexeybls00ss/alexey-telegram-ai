@@ -153,7 +153,7 @@ class PhotoArchiveTests(unittest.IsolatedAsyncioTestCase):
                     ("photo-test-connection",935010,5021)).fetchone()
             self.assertIsNotNone(stored)
             self.assertTrue(Path(stored["file_path"]).is_file())
-            self.assertEqual(stored["file_size"],6)
+            self.assertEqual(stored["file_size"],len(b"\xff\xd8test\xff\xd9"))
             self.assertTrue(await app.archive_business_photo(event_message))
             download.assert_awaited_once()
             await app.handle_deleted_business_messages(deleted)
